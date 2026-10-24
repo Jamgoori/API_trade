@@ -1,0 +1,120 @@
+# hedgebot 설정 예시. config.yaml 로 복사해서 수정하세요 (config.yaml 은 git 에 올라가지 않습니다).
+#   cp config.example.yaml config.yaml
+#
+# 구조: Arcus(메이커, 포인트 적립) 와 Hyperliquid HIP-3(trade.xyz=hl:xyz, Entropy=hl:io) 에
+#       같은 종목을 같은 수량, 반대 방향으로 잡아 가격 위험을 없앤 채 Arcus 포인트를 쌓습니다.
+
+mode: paper            # paper(실시세 모의) | testnet | live
+
+# 거래소별 자금. paper 모드에서는 모의 잔고로 쓰입니다.
+capital:
+  arcus: 8000          # USDG
+  hl:xyz: 3000         # USDC (trade.xyz 증거금 계정)
+  hl:io: 3000          # USDC (Entropy 증거금 계정, 격리 전용이라 여유 있게)
+
+arcus:
+  account_index: 0     # 봇 전용 서브계정을 권장합니다 (API 키 발급 시 Subaccount # 선택)
+  dead_mans_switch_s: 60   # 봇이 죽으면 60초 뒤 Arcus 미체결 주문 자동 취소
+  margin_mode: cross   # 교차증거금: 계정 전체가 각 포지션을 받쳐 줘서 청산까지 여유가 큽니다
+
+hyperliquid:
+  dexes: [xyz, io]
+  base_maker_fee: 0.00015  # 본인 HL 수수료 등급 (HIP-3 배수 적용 전)
+  base_taker_fee: 0.00045
+  margin_mode: cross   # Entropy(io) 는 격리 전용이라 자동으로 격리증거금이 됩니다
+
+# 페어: maker = 메이커 주문을 거는 쪽(Arcus RWA 메이커 수수료 0%), hedge = 체결 즉시 테이커로 헤지하는 쪽
+# direction: auto 는 펀딩비 차이가 의미 있으면 펀딩을 받는 방향, 아니면 Arcus 안에서 롱/숏이 상쇄되도록 번갈아 배치
+pairs:
+  - name: NVDA
+    maker: {venue: arcus, symbol: NVDA-USD}
+    hedge: {venue: "hl:xyz", symbol: "xyz:NVDA"}
+    notional_usd: 7000
+    leverage: 5
+    direction: auto
+
+  - name: TSLA
+    maker: {venue: arcus, symbol: TSLA-USD}
+    hedge: {venue: "hl:xyz", symbol: "xyz:TSLA"}
+    notional_usd: 5000
+    leverage: 5
+    direction: auto
+
+  # --- Entropy 활동용 (Arcus 와 겹치는 종목은 SNDK / DRAM / NBIS 뿐) ---
+  - name: SNDK-entropy
+    maker: {venue: arcus, symbol: SNDK-USD}
+    hedge: {venue: "hl:io", symbol: "io:SNDK"}
+    notional_usd: 4000
+    leverage: 2        # Entropy 는 격리 전용이라 다른 계정 돈으로 버틸 수 없음. 백테스트상 4배는 청산 발생
+    direction: auto
+
+  - name: DRAM-entropy
+    maker: {venue: arcus, symbol: DRAM-USD}
+    hedge: {venue: "hl:io", symbol: "io:DRAM"}
+    notional_usd: 2000
+    leverage: 2
+    direction: auto
+
+strategy:
+  clip_usd_min: 600        # 한 번에 거는 메이커 주문 크기 (랜덤)
+  clip_usd_max: 2000
+  maker_price: join        # join: 최우선 호가에 합류 | improve: 스프레드가 넓으면 1틱 개선
+  reprice_after_s: 15      # 호가가 멀어지면 이 시간 뒤 재호가
+  clip_timeout_s: 900
+  min_hold_h: 6            # 포지션 유지(OI) 후 회전까지 랜덤 대기 시간 (백테스트상 3-8h 보다 포인트당 비용이 낮음)
+  max_hold_h: 12
+  rotation_fraction_min: 0.3   # 회전 때 줄였다 다시 채우는 비율 (랜덤)
+  rotation_fraction_max: 0.7
+  rotate_when: off_hours   # off_hours: Arcus 장외시간(포인트 부스트 시간대)에만 회전 | any
+  max_daily_cost_usd: 20   # 하루 수수료+슬리피지 예산. 넘으면 회전 중단 (포지션은 유지)
+  basis_guard_bps: 8       # 두 거래소 가격 차이가 평소보다 이만큼 불리하면 진입/청산 보류
+  max_maker_spread_bps: 25
+  max_hedge_spread_bps: 20
+  min_carry_edge_apr: 0.03 # 연 3% 이상 펀딩 차이가 있을 때만 펀딩 기준으로 방향 결정
+  flip_carry_apr: 0.08     # 반대 방향 펀딩이 연 8% 이상 유리하면 회전 때 방향 전환
+  funding_window_h: 168    # 방향 판단에 쓰는 펀딩 평균 기간 (24h 는 잡음 때문에 방향을 너무 자주 바꿈)
+  target_tolerance: 0.08
+  session_blackout_min: 3  # 04:00 / 20:00 ET (Arcus 증거금 규칙이 바뀌는 시각) 전후 3분은 신규 주문 안 함
+
+execution:
+  # passive_first: 헤지를 먼저 메이커(호가에 걸어두기)로 시도하고, 20초 안에 안 잡히거나
+  #                3bp 불리하게 움직이면 테이커로 즉시 체결. 백테스트상 포인트당 비용 약 25~50% 절감
+  # taker: Arcus 체결 즉시 테이커로 헤지 (한쪽만 잡힌 시간 최소, 비용은 더 큼)
+  hedge_mode: passive_first
+  passive_hedge_timeout_s: 20
+  passive_hedge_max_adverse_bps: 3
+  passive_hedge_requote_s: 4
+  hedge_slippage_bps: [5, 15, 40]   # 헤지 IOC 가격 여유를 단계적으로 넓힘
+  urgent_slippage_bps: 30           # 비상 청산/불균형 수리용
+  imbalance_tolerance_usd: 40       # 두 다리 차이가 이 금액을 넘으면
+  imbalance_grace_s: 8              # 이 시간 확인 후 큰 쪽을 줄여서 맞춤
+  ioc_confirm_timeout_s: 6
+
+risk:
+  margin_ratio_warn: 3.0            # 자산/유지증거금 비율. 경고 + 입금 금액 안내
+  margin_ratio_critical: 1.7        # 이 밑이면 해당 거래소의 모든 페어를 30% 줄임 (양쪽 다리 동시에)
+  isolated_liq_buffer_warn_pct: 8   # 격리 포지션(Entropy) 청산가까지 거리
+  isolated_liq_buffer_critical_pct: 4
+  derisk_fraction: 0.3
+  max_account_leverage: 5           # 거래소 계정 전체 명목가 / 자산 상한
+  max_daily_loss_pct: 2             # 하루 손실이 전체 자산의 2% 넘으면 신규 진입/회전 중단
+  stale_data_s: 20
+  max_consecutive_errors: 5
+
+poll:
+  active_s: 1.0        # 주문이 걸려 있을 때 확인 주기
+  idle_s: 3.0
+  markets_s: 60
+  account_s: 5
+  snapshot_s: 60
+  funding_refresh_s: 3600
+
+paper:
+  maker_fill: through  # through: 가격이 내 호가를 뚫고 지나가야 체결(보수적) | touch: 닿으면 체결(낙관적)
+  state_dir: data/paper
+
+points:
+  arcus_points_per_musd: 33   # 커뮤니티 공개치 기준 추정 (RWA 위주 $100만당 약 30~40포인트)
+
+journal_path: data/journal.sqlite
+log_dir: data/logs

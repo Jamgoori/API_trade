@@ -1,0 +1,18 @@
+# secrets
+.env
+*.pem
+
+# local state
+data/
+config.yaml
+*.sqlite
+*.sqlite-journal
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+dist/
