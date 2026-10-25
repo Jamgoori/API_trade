@@ -371,7 +371,8 @@ class Engine:
         self._guarded("risk", self.risk.evaluate)
         for ex in self.executors:
             ex.step()  # contains its own errors
-        if self.backstops and self._due("backstop", cfg.risk.backstop_refresh_s):
+        if self.backstops and self._due("backstop", min(10, cfg.risk.backstop_refresh_s) if self.backstops.skipped
+                                        else cfg.risk.backstop_refresh_s):
             self._guarded("backstop", self.backstops.refresh)
         if self._due("snapshot", cfg.poll.snapshot_s):
             self._guarded("snapshot", self._snapshots)

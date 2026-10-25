@@ -72,12 +72,15 @@ class BackstopManager:
         self.engine = engine
         self.cfg = engine.cfg
         self.active: dict[tuple[str, str], Backstop] = {}
+        self.skipped = False  # a pair was skipped (hedge in flight): the engine retries sooner
 
     def _legs(self):
         # Busy pairs too: a pair builds or rotates for hours in back-to-back clips, and a reduce-only,
         # position-sized stop is safe mid-clip. Only skipped while a hedge is in flight.
+        self.skipped = False
         for ex in self.engine.executors:
             if ex.clip is not None and (ex.clip.hedge_pending > 0 or ex.clip.hedge_order is not None):
+                self.skipped = True
                 continue
             yield ex, ex.pair.maker.venue, ex.pair.maker.symbol
             yield ex, ex.pair.hedge.venue, ex.pair.hedge.symbol
