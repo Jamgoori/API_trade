@@ -69,3 +69,17 @@ def test_executor_grows_the_position_when_the_scale_changes(setup_pair):
     assert positions(venues) == (Dd(60), Dd(-60))
     assert ex.rt.scale_seen == 1
     assert "resize" in ctx.kinds()
+
+
+def test_growth_is_capped_by_the_venue_with_the_least_money():
+    s = scaler()
+    assert s.target(Dd(2), Dd("1.3")) == Dd("1.3")
+    assert s.target(Dd(2), Dd("0.8")) == 1  # a lagging venue blocks growth but does not shrink
+    assert s.target(Dd("0.8"), Dd("0.5")) == Dd("0.8")  # shrinking follows the total
+
+
+def test_a_pending_change_does_not_flap_at_the_threshold():
+    s = scaler(min_change_pct=10, grow_after_min=30)
+    assert s.observe(Dd("1.101"), 0)[0] == "pending"
+    assert s.observe(Dd("1.099"), 600) is None  # still within half the threshold: stays pending
+    assert s.observe(Dd("1.101"), 1800) == ("apply", Dd("1.10"))

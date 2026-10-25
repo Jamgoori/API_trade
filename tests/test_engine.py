@@ -37,10 +37,18 @@ def engine(tmp_path, monkeypatch):
 
 def test_first_start_sizes_to_equity_and_persists_it(engine):
     eng, _ = engine(capital={"arcus": D(5000), "hl:xyz": D(2500)})  # paper balances = capital, so x1...
-    eng.venues["arcus"].cash += D(7500)  # ...plus a deposit before the first start: x2
+    eng.venues["arcus"].cash += D(5000)  # ...plus deposits in proportion before the first start: x2
+    eng.venues["hl:xyz"].cash += D(2500)
     eng.setup()
     assert eng.size_scale() == (Dd("2.00"), 1)
     assert eng.journal.load_pair_state("__sizing__")["scale"] == "2.00"
+
+
+def test_a_deposit_on_one_venue_does_not_grow_the_other_venues_legs(engine):
+    eng, _ = engine(capital={"arcus": D(5000), "hl:xyz": D(2500)})
+    eng.venues["arcus"].cash += D(7500)  # all of it on Arcus: the hedge venue still has x1
+    eng.setup()
+    assert eng.size_scale()[0] == 1
 
 
 def test_stops_are_placed_right_after_start_up(engine):

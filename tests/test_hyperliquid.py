@@ -91,3 +91,42 @@ def test_unified_account_mode_is_refused_before_trading():
     check_hl_mode({"hl:io": HyperliquidVenue(Client("disabled"), "io")})
     with pytest.raises(SystemExit, match="unifiedAccount"):
         check_hl_mode({"hl:io": HyperliquidVenue(Client("unifiedAccount"), "io")})
+
+
+class Info:
+    def __init__(self, rows):
+        self.rows, self.calls = rows, []
+
+    def __call__(self, body, weight=20):
+        self.calls.append(body)
+        return self.rows(body) if callable(self.rows) else self.rows
+
+
+def test_lost_response_finds_a_rejected_order_by_cloid():
+    class Boom(FakeExchange):
+        def order(self, *a, **k):
+            raise TimeoutError("read timeout")
+
+    v, _ = _venue(None)
+    v.client._exchange = Boom(None)
+    v.client.info = Info({"status": "order", "order": {"status": "badAloPxRejected",
+                                                       "order": {"oid": 7, "origSz": "1", "sz": "1"}}})
+    st = v.place_order("xyz:NVDA", Side.BUY, Decimal("1"), Decimal("100"), Tif.ALO)
+    assert st.status is OrderStatus.REJECTED and st.order_id == "7"
+    assert v.client.info.calls[0]["oid"].startswith("0x")  # looked up by cloid
+
+
+def test_cancel_resting_keeps_trigger_stops():
+    cancelled = []
+
+    class Ex(FakeExchange):
+        def cancel(self, name, oid):
+            cancelled.append(oid)
+            return {"status": "ok", "response": {"data": {"statuses": ["success"]}}}
+
+    v, _ = _venue(None)
+    v.client._exchange = Ex(None)
+    v.client.info = Info([{"coin": "xyz:NVDA", "oid": 1, "isTrigger": False},
+                          {"coin": "xyz:NVDA", "oid": 2, "isTrigger": True}])
+    v.cancel_resting()
+    assert cancelled == [1]

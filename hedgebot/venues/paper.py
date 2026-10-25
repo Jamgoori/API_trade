@@ -385,6 +385,9 @@ class PaperVenue(Venue):
         for order_id in list(self.orders):
             self.cancel_order("", order_id)
 
+    def cancel_resting(self) -> None:
+        self.cancel_all()  # paper stops live in self.stops and are untouched
+
     def add_isolated_margin(self, symbol: str, amount: Decimal) -> None:
         pos = self.positions.get(symbol)
         if pos is None or not pos.isolated:

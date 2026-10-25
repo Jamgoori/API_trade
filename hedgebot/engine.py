@@ -84,6 +84,10 @@ class Engine:
         self.rng = random.Random(cfg.strategy.seed)
         saved = self.journal.load_pair_state("__sizing__") or {}
         self.scaler = SizeScaler(cfg.sizing, D(saved.get("scale", 1)), int(saved.get("version", 0)), bool(saved))
+        if not cfg.sizing.scale_with_equity and self.scaler.scale != 1:
+            # sizing switched off: back to the configured notional (the version bump retargets every pair)
+            self.scaler.scale, self.scaler.version = D(1), self.scaler.version + 1
+            self.journal.save_pair_state("__sizing__", self.scaler.state())
 
         trading = cfg.mode in ("testnet", "live")
         market_venues = build_market_venues(cfg, secrets, trading=trading)
@@ -186,25 +190,34 @@ class Engine:
         self.event("info", "resume", f"resumed ({why})", notify=True)
 
     # ----------------------------------------------------------------- sizing
-    def measure_scale(self) -> Decimal | None:
-        """Total live equity / total configured capital; None when it cannot be measured."""
+    def measure_scale(self) -> tuple[Decimal, Decimal, str] | None:
+        """(total equity / total capital, lowest per-venue ratio, that venue); None when unmeasurable."""
         venues = [v for v in self.venues if D(self.cfg.capital.get(v, 0)) > 0]
         base = sum((D(self.cfg.capital[v]) for v in venues), ZERO)
         if base <= 0:
             return None
         try:
-            return sum((self.account(v, self.cfg.poll.account_s).equity for v in venues), ZERO) / base
+            equity = {v: self.account(v, self.cfg.poll.account_s).equity for v in venues}
         except VenueError as exc:
             log.warning("sizing: equity read failed: %s", exc)
             return None
+        ratios = {v: equity[v] / D(self.cfg.capital[v]) for v in venues}
+        tightest = min(ratios, key=ratios.get)
+        return sum(equity.values(), ZERO) / base, ratios[tightest], tightest
 
     def _update_scale(self, now: float | None = None) -> None:
         z = self.cfg.sizing
         if not z.scale_with_equity:
             return
-        raw = self.measure_scale()
-        if raw is None:
+        measured = self.measure_scale()
+        if measured is None:
             return
+        total, tightest, short_venue = measured
+        raw = self.scaler.target(total, tightest)
+        if total > self.scaler.scale * (1 + z.min_change_pct / 100) and raw < total:
+            self.event("info", "sizing", f"equity is x{total:.2f} of the configured capital, but {short_venue} only "
+                       f"x{tightest:.2f}: move money there to grow every pair (hedgebot rebalance)", notify=True,
+                       throttle_key="sizing_short", throttle_s=6 * 3600)
         first = not self.scaler.known
         old = self.scaler.scale
         result = self.scaler.observe(raw, now or time.time())
@@ -216,7 +229,8 @@ class Engine:
         if kind == "pending":
             wait = f"{z.grow_after_min:g} min" if value > old else f"{z.shrink_after_h:g} h"
             self.event("info", "sizing", f"equity is x{value:.2f} of the configured capital (positions sized for "
-                       f"x{old}); resizing if it holds for {wait}", notify=True)
+                       f"x{old}); resizing if it holds for {wait}", notify=True, throttle_key="sizing_pending",
+                       throttle_s=3600)
         elif kind == "cleared":
             log.info("sizing: equity back near x%s, no resize", old)
         else:
@@ -260,7 +274,11 @@ class Engine:
                 except VenueError as exc:
                     self.event("warning", "setup", f"{name}: cancel_all failed: {exc}")
         for name in self.venues:
-            acct = self.account(name, 0)
+            try:  # after cancel_all: one slow venue must not hold the stops of the others hostage
+                acct = self.account(name, 0)
+            except VenueError as exc:
+                self.event("warning", "setup", f"{name}: account read failed at start-up: {exc}", notify=True)
+                continue
             self.journal.snapshot(acct)
             self.event("info", "setup", f"{name}: equity ${acct.equity:,.2f}, positions "
                        f"{ {s: str(p.size) for s, p in acct.positions.items()} }")
@@ -424,7 +442,9 @@ class Engine:
         self._install_signals()
         try:
             self._setup_with_retry()
-        except BaseException:
+        except BaseException as exc:
+            if not (isinstance(exc, SystemExit) and str(exc) == "stopped during start-up"):
+                self.notifier.send(f"start-up aborted, the bot is NOT running: {exc}", level="critical")
             self.notifier.flush()
             raise
         if self.backstops:  # start-up canceled the old stops: put them back before anything else
@@ -477,6 +497,12 @@ def flatten_all(engine: Engine, attempts: int = 3) -> list[str]:
     """
     if not engine.executors:
         engine.setup(cancel_orders=False)  # keep the exchange stops until each leg is actually closed
+    if engine.cfg.mode in ("testnet", "live"):
+        for name, venue in engine.venues.items():
+            try:  # a resting maker / passive hedge left by a crash would reopen a leg after the flatten
+                venue.cancel_resting()
+            except VenueError as exc:
+                engine.event("critical", "flatten", f"{name}: could not cancel resting orders: {exc}", notify=True)
     leftovers = []
     try:
         for ex in engine.executors:

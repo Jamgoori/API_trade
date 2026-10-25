@@ -110,3 +110,76 @@ def test_unexpected_exception_is_contained_then_disables_the_pair(setup_pair):
     for _ in range(MAX_UNEXPECTED_ERRORS):
         ex.step(time.time())  # must not raise
     assert ex.disabled_reason and "pair_disabled" in ctx.kinds()
+
+
+def test_a_lost_hedge_response_is_reconciled_instead_of_hedging_again(setup_pair):
+    cfg, ctx, venues, arcus, hl = setup_pair()
+    ex = PairExecutor(cfg.pairs[0], ctx, random.Random(1))
+    ex.step(time.time())
+    real = venues["hl:xyz"].place_order
+
+    def fills_then_times_out(*a, **k):
+        real(*a, **k)
+        raise VenueError("read timeout", retryable=True)
+
+    venues["hl:xyz"].place_order = fills_then_times_out
+    arcus.set_book("TST-USD", "99.90", "99.92")
+    now = time.time()
+    ex.step(now)
+    venues["hl:xyz"].place_order = real
+    run_steps(ex, 5, start=now + 1)
+    assert positions(venues) == (10, -10)  # hedged once, not once per tick
+    assert "hedge_recovered" in ctx.kinds()
+
+
+def test_failing_maker_cancel_hedges_as_taker_right_away(setup_pair):
+    cfg, ctx, venues, arcus, hl = setup_pair()
+    cfg.execution.hedge_mode = "passive_first"
+    ex = PairExecutor(cfg.pairs[0], ctx, random.Random(1))
+    ex.step(time.time())
+
+    def cancel_429(*a, **k):
+        raise VenueError("HTTP 429", status=429, retryable=True)
+
+    venues["arcus"].cancel_order = cancel_429
+    order = ex.clip.order
+    venues["arcus"]._apply_fill(venues["arcus"].orders[order.order_id], Dd(4), order.price, "maker")
+    venues["arcus"].orders[order.order_id].filled = Dd(4)
+    ex.step(time.time())
+    assert positions(venues) == (4, -4)  # hedged on HL although the Arcus cancel keeps failing
+    assert "hedge_failed" not in ctx.kinds()
+
+
+def test_disabled_pair_cancels_its_resting_order(setup_pair):
+    cfg, ctx, venues, arcus, hl = setup_pair()
+    ex = PairExecutor(cfg.pairs[0], ctx, random.Random(1))
+    ex.step(time.time())
+    order_id = ex.clip.order.order_id
+
+    def broken(*a, **k):
+        raise KeyError("statuses")
+
+    venues["hl:xyz"].market = broken
+    for _ in range(MAX_UNEXPECTED_ERRORS):
+        ex.step(time.time())
+    assert ex.disabled_reason
+    assert order_id not in venues["arcus"].orders  # no naked fill can come from it later
+
+
+def test_failed_repair_is_not_repeated_on_a_stale_account(setup_pair):
+    cfg, ctx, venues, arcus, hl = setup_pair()
+    ex = held(cfg, ctx, venues)
+    venues["hl:xyz"].place_order("xyz:TST", Side.BUY, Dd(10), Dd("100.02"), Tif.IOC, reduce_only=True)
+    real, calls = venues["arcus"].place_order, []
+
+    def places_then_errors(*a, **k):
+        calls.append(a)
+        real(*a, **k)
+        raise VenueError("order status 503", retryable=True)
+
+    venues["arcus"].place_order = places_then_errors
+    now = time.time()
+    ex.step(now)
+    ex.step(now + 1)  # repair sent (and filled) but the call raised
+    ex.step(now + 2)
+    assert len(calls) == 1 and positions(venues) == (20, -20)

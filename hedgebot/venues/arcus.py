@@ -457,6 +457,15 @@ class ArcusVenue(Venue):
         self._legacy_post("/v1/cancelAllOrders", "cancelAllOrders",
                           {"address": signer.address, "accountIndex": signer.account_index})
 
+    def cancel_resting(self) -> None:
+        """Cancel resting orders (status OPEN), keeping untriggered position stops."""
+        signer = self._require_signer()
+        body = self._get("/v1/openOrders", 2, {"address": signer.address, "accountIndex": signer.account_index,
+                                               "status": "OPEN"})
+        for o in body.get("orders", []):
+            if o.get("status") == "OPEN" and not o.get("tpslType"):
+                self.cancel_order(o["marketDisplayName"], o["orderId"])
+
     def set_leverage(self, symbol: str, leverage: int, cross: bool) -> None:
         signer = self._require_signer()
         body = {
@@ -514,6 +523,8 @@ class ArcusVenue(Venue):
             if exc.status and 400 <= exc.status < 500 and exc.status not in (401, 429):
                 state.status, state.reject_reason = OrderStatus.REJECTED, str(exc.payload)
                 return state
+            if exc.status not in (401, 429, 502):  # may have been accepted: do not leave an untracked stop
+                self._cancel_quietly(symbol, client_id)
             raise
         row = (resp.get("responses") or [{}])[0]
         state.order_id = str(row.get("orderId", ""))

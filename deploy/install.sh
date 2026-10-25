@@ -31,6 +31,11 @@ if [ ! -f .env ]; then
   echo ".env 생성: 키를 채워 넣으세요  ->  nano $REPO/.env"
 fi
 chmod 600 .env
+if [ "$(id -u)" -eq 0 ] && [ "$RUN_USER" != "root" ]; then
+  # run with sudo: the service runs as $RUN_USER, so it must own its venv, config, keys and data
+  mkdir -p data
+  chown -R "$RUN_USER": .venv config.yaml .env data
+fi
 
 UNIT=/etc/systemd/system/hedgebot.service
 TMP="$(mktemp)"

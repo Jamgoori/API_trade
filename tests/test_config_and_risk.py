@@ -117,15 +117,29 @@ def test_isolated_position_near_liquidation_is_cut_when_no_free_balance():
     assert eng.reductions and eng.reductions[0][0] == "T"
 
 
+def held(venue, equity, mark, size=100):
+    sym = "TST-USD" if venue == "arcus" else "xyz:TST"
+    return acct(venue, equity, 0, {sym: Position(sym, Dd(size), Dd(100), Dd(mark))})
+
+
 def test_daily_loss_halts_new_risk():
     cfg = make_config()
-    eng = FakeEngine({"arcus": acct("arcus", 10000, 0, {}), "hl:xyz": acct("hl:xyz", 5000, 0, {})})
+    eng = FakeEngine({"arcus": held("arcus", 10000, 100), "hl:xyz": acct("hl:xyz", 5000, 0, {})})
     rm = RiskManager(cfg, eng)
     rm.evaluate()
-    for equity in (9850, 9700, 9600):  # losses accrue gradually: -2.7% of 15k
-        eng.accounts["arcus"] = acct("arcus", equity, 0, {})
-        rm.evaluate()
+    eng.accounts["arcus"] = held("arcus", 9600, 96)  # the price fell 4% on an (unhedged) position: -2.7% of 15k
+    rm.evaluate()
     assert eng.halted and eng.halt_reason == "daily loss"
+
+
+def test_a_sudden_loss_that_changes_positions_is_not_mistaken_for_a_transfer():
+    cfg = make_config()
+    eng = FakeEngine({"arcus": held("arcus", 10000, 100), "hl:xyz": acct("hl:xyz", 5000, 0, {})})
+    rm = RiskManager(cfg, eng)
+    rm.evaluate()
+    eng.accounts["arcus"] = acct("arcus", 9500, 0, {})  # liquidated: position gone, $500 lost at once
+    rm.evaluate()
+    assert eng.halted
 
 
 def test_foreign_positions_are_reported_once():
@@ -140,17 +154,17 @@ def test_foreign_positions_are_reported_once():
 
 def test_money_moving_between_venues_is_not_a_daily_loss():
     cfg = make_config()
-    eng = FakeEngine({"arcus": acct("arcus", 10000, 0, {}), "hl:xyz": acct("hl:xyz", 5000, 0, {})})
+    eng = FakeEngine({"arcus": held("arcus", 10000, 100), "hl:xyz": held("hl:xyz", 5000, 100, size=-100)})
     rm = RiskManager(cfg, eng)
     rm.evaluate()
-    eng.accounts["arcus"] = acct("arcus", 8000, 0, {})  # $2k sent from Arcus, not arrived yet
+    eng.accounts["arcus"] = held("arcus", 8000, 100)  # $2k sent from Arcus, not arrived yet
     rm.evaluate()
     assert not eng.halted
-    eng.accounts["hl:xyz"] = acct("hl:xyz", 7000, 0, {})  # it landed
+    eng.accounts["hl:xyz"] = held("hl:xyz", 7000, 100, size=-100)  # it landed
     rm.evaluate()
-    for equity in (6900, 6800, 6700):  # then a real, gradual loss of $300 (2% of 15k)
-        eng.accounts["hl:xyz"] = acct("hl:xyz", equity, 0, {})
-        rm.evaluate()
+    assert not eng.halted and rm.day_start_equity == 15000
+    eng.accounts["hl:xyz"] = held("hl:xyz", 6700, 103, size=-100)  # then a real loss: the short lost $300
+    rm.evaluate()
     assert eng.halted
 
 
@@ -169,3 +183,16 @@ def test_unreadable_venue_does_not_stop_checks_on_the_others():
     RiskManager(cfg, eng).evaluate()
     assert eng.venues["hl:xyz"].added  # the isolated top-up still ran
     assert not eng.halted
+
+
+def test_a_transfer_made_while_the_bot_was_stopped_is_recognised_after_restart(tmp_path):
+    from hedgebot.journal import Journal
+
+    cfg = make_config()
+    eng = FakeEngine({"arcus": held("arcus", 10000, 100), "hl:xyz": held("hl:xyz", 5000, 100, size=-100)})
+    eng.journal = Journal(str(tmp_path / "j.sqlite"))
+    RiskManager(cfg, eng).evaluate()
+    eng.accounts["arcus"] = held("arcus", 7000, 100)  # bot stopped; $3k sent to the other venue, in transit
+    restarted = RiskManager(cfg, eng)
+    restarted.evaluate()
+    assert not eng.halted and restarted.day_start_equity == 12000

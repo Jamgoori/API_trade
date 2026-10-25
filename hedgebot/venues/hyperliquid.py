@@ -280,8 +280,14 @@ class HyperliquidVenue(Venue):
                 reduce_only=reduce_only, cloid=Cloid(cloid),
             )
         except Exception as exc:  # the SDK raises plain exceptions on transport errors
-            # The order may have reached the book with the response lost: find it by cloid.
-            found = self._by_cloid(cloid, state)
+            # The order may have reached the book with the response lost: find it by cloid
+            # (a few tries: a just-sent order may not be indexed yet).
+            found = None
+            for attempt in range(4):
+                found = self._by_cloid(cloid, state)
+                if found is not None:
+                    break
+                time.sleep(0.7)
             if found is not None:
                 log.warning("%s order %s: response lost (%s) but the order exists: %s", self.name, symbol, exc,
                             found.status.value)
@@ -338,10 +344,13 @@ class HyperliquidVenue(Venue):
             order.status = OrderStatus.OPEN
         elif raw == "filled":
             order.status, order.filled = OrderStatus.FILLED, orig
-        elif raw.endswith("anceled") or raw in ("triggered",):
+        elif raw.endswith("anceled") or raw in ("triggered", "scheduledCancel"):
             order.status = OrderStatus.CANCELED
-        elif raw == "rejected":
+        else:  # "rejected", "badAloPxRejected", "perpMarginRejected", ... and anything unknown is terminal
+            if raw != "rejected" and not raw.endswith("Rejected"):
+                log.warning("hyperliquid order %s: unknown status %r treated as rejected", order.order_id, raw)
             order.status = OrderStatus.REJECTED
+            order.reject_reason = order.reject_reason or raw
         return order
 
     def cancel_order(self, symbol: str, order_id: str) -> None:
@@ -367,6 +376,12 @@ class HyperliquidVenue(Venue):
                 failed.append(f"{o['coin']} {o['oid']}: {exc}")
         if failed:
             raise VenueError(f"{self.name} cancel_all: {len(failed)} failed: {'; '.join(failed)}", retryable=True)
+
+    def cancel_resting(self) -> None:
+        rows = self.client.info({"type": "frontendOpenOrders", "user": self._user(), "dex": self.dex}, 20)
+        for o in rows:
+            if not o.get("isTrigger"):  # keep the exchange stops (trigger orders)
+                self.cancel_order(o["coin"], str(o["oid"]))
 
     def add_isolated_margin(self, symbol: str, amount: Decimal) -> None:
         try:

@@ -162,6 +162,10 @@ class Venue(ABC):
     def cancel_all(self) -> None:
         raise VenueError(f"{self.name}: trading needs credentials")
 
+    def cancel_resting(self) -> None:
+        """Cancel resting (non-stop) orders, keeping the exchange stops. Defaults to cancel_all."""
+        self.cancel_all()
+
     def set_leverage(self, symbol: str, leverage: int, cross: bool) -> None:
         raise VenueError(f"{self.name}: trading needs credentials")
 

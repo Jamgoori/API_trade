@@ -1,7 +1,9 @@
 """Equity-based sizing: every pair targets notional_usd x scale, scale = live equity / configured capital.
 
-Growth needs the higher equity to hold for `grow_after_min` (a deposit has landed); a drop must
-hold for `shrink_after_h`, so money in transit between venues (a rebalance) never cuts positions.
+Growth needs the higher equity to hold for `grow_after_min` (a deposit has landed) and is capped by
+the venue with the least money relative to its capital, so a deposit on one venue does not push the
+other venue's legs past its own margin. A drop must hold for `shrink_after_h`, so money in transit
+between venues (a rebalance) never cuts positions.
 """
 
 from __future__ import annotations
@@ -23,6 +25,12 @@ class SizeScaler:
     def clamp(self, raw: Decimal) -> Decimal:
         return min(max(D(raw), self.cfg.min_scale), self.cfg.max_scale)
 
+    def target(self, total: Decimal, tightest: Decimal | None = None) -> Decimal:
+        """Scale to aim for: total equity ratio, but growth only as far as the tightest venue allows."""
+        if tightest is not None and total > self.scale:
+            return max(self.scale, min(total, tightest))
+        return total
+
     def observe(self, raw: Decimal, now: float) -> tuple[str, Decimal] | None:
         """Feed a measurement. Returns ("pending", raw) when a change is first seen,
         ("apply", new_scale) when the size changes, ("cleared", raw) when a pending change faded."""
@@ -30,7 +38,8 @@ class SizeScaler:
         if not self.known:
             return self._apply(raw)
         change = raw / self.scale - 1
-        if abs(change) * 100 < self.cfg.min_change_pct:
+        threshold = self.cfg.min_change_pct / (2 if self.pending else 1)  # hysteresis: no flapping at the edge
+        if abs(change) * 100 < threshold:
             faded, self.pending = self.pending is not None, None
             return ("cleared", raw) if faded else None
         direction = 1 if change > 0 else -1
