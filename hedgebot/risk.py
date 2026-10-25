@@ -81,6 +81,9 @@ class RiskManager:
                 if pos.liquidation_price is None or pos.mark_price <= 0 or pos.margin_mode != "isolated":
                     continue
                 distance = abs(pos.mark_price - pos.liquidation_price) / pos.mark_price * 100
+                if distance < r.isolated_liq_buffer_warn_pct and r.isolated_topup_enabled:
+                    if self._top_up(name, acct, pos, pair):
+                        continue
                 if distance < r.isolated_liq_buffer_critical_pct:
                     self._derisk(pair, f"{symbol} {distance:.1f}% from liquidation", now)
                     self.engine.event("critical", "liq_distance",
@@ -91,6 +94,40 @@ class RiskManager:
                                       f"{name} {symbol}: {distance:.1f}% from liquidation - add margin", venue=name,
                                       pair=pair, notify=True, throttle_key=f"lwarn:{name}:{symbol}", throttle_s=3600)
         self._daily_loss(total)
+
+    def _top_up(self, venue_name: str, acct, pos, pair: str) -> bool:
+        """Push the liquidation price of an isolated position back to `isolated_topup_target_pct`.
+
+        Moving $1 into the position shifts its liquidation price by 1 / (|size| * (1 -/+ mmf)).
+        Returns True when the buffer was fully restored.
+        """
+        r = self.cfg.risk
+        venue = self.engine.venues[venue_name]
+        mmf = venue.market(pos.symbol).maintenance_margin_fraction
+        target = r.isolated_topup_target_pct / 100
+        if pos.size > 0:
+            liq_target = pos.mark_price * (1 - target)
+            need = (pos.liquidation_price - liq_target) * pos.size * (1 - mmf)
+        else:
+            liq_target = pos.mark_price * (1 + target)
+            need = (liq_target - pos.liquidation_price) * abs(pos.size) * (1 + mmf)
+        if need <= 0:
+            return True
+        amount = min(need, acct.free_collateral * Decimal("0.95")).quantize(Decimal("0.01"))
+        if amount < 5:
+            return False
+        try:
+            venue.add_isolated_margin(pos.symbol, amount)
+        except VenueError as exc:
+            self.engine.event("warning", "topup", f"{venue_name} {pos.symbol}: margin top-up failed: {exc}",
+                              venue=venue_name, pair=pair, throttle_key=f"topup:{venue_name}", throttle_s=1800)
+            return False
+        self.engine.invalidate_account(venue_name)
+        full = amount >= need
+        self.engine.event("warning", "topup", f"{venue_name} {pos.symbol}: added ${amount:,.2f} isolated margin"
+                          f"{'' if full else f' (needed ${need:,.0f}; free balance ran out - deposit more)'}",
+                          venue=venue_name, pair=pair, notify=True)
+        return full
 
     def _daily_loss(self, total: Decimal) -> None:
         key = datetime.now(timezone.utc).strftime("%Y-%m-%d")

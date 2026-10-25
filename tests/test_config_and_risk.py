@@ -19,7 +19,8 @@ def write(tmp_path, text):
 def test_example_config_loads():
     cfg = load_config("config.example.yaml")
     assert cfg.venues_needed() == ["arcus", "hl:xyz", "hl:io"]
-    assert cfg.capital["hl:io"] == Dd(3000)
+    assert cfg.capital["hl:io"] == Dd(5250)
+    assert {p.group for p in cfg.pairs} == {"rwa", "io"}
     assert cfg.execution.hedge_mode == "passive_first"
 
 
@@ -45,10 +46,22 @@ def test_unknown_keys_and_bad_values_are_rejected(tmp_path):
         """))
 
 
+class FakeVenue:
+    def __init__(self):
+        self.added = []
+
+    def market(self, symbol):
+        from tests.conftest import make_market
+        return make_market("v", symbol, maintenance_margin_fraction=Dd("0.02"))
+
+    def add_isolated_margin(self, symbol, amount):
+        self.added.append((symbol, amount))
+
+
 class FakeEngine:
     def __init__(self, accounts):
         self.accounts = accounts
-        self.venues = {k: None for k in accounts}
+        self.venues = {k: FakeVenue() for k in accounts}
         self.halted = False
         self.halt_reason = None
         self.reductions = []
@@ -56,6 +69,9 @@ class FakeEngine:
 
     def account(self, venue, max_age_s=5):
         return self.accounts[venue]
+
+    def invalidate_account(self, venue):
+        pass
 
     def request_reduction(self, pair, fraction, reason):
         self.reductions.append((pair, fraction))
@@ -82,11 +98,22 @@ def test_low_cross_margin_ratio_derisks_pairs_on_that_venue():
     assert eng.reductions == [("T", cfg.risk.derisk_fraction)]
 
 
-def test_isolated_position_near_liquidation_is_cut():
+def test_isolated_position_near_liquidation_is_topped_up_from_free_balance():
     cfg = make_config()
     pos = {"xyz:TST": Position("xyz:TST", Dd(-10), Dd(100), Dd(100), liquidation_price=Dd(103), margin_mode="isolated")}
     eng = FakeEngine({"arcus": acct("arcus", 9000, 0, {}), "hl:xyz": acct("hl:xyz", 5000, 0, pos)})
     RiskManager(cfg, eng).evaluate()
+    # liq 103 -> target 115 (15% above mark) needs (115 - 103) * 10 * 1.02 = $122.40
+    assert eng.venues["hl:xyz"].added == [("xyz:TST", Dd("122.40"))]
+    assert not eng.reductions
+
+
+def test_isolated_position_near_liquidation_is_cut_when_no_free_balance():
+    cfg = make_config()
+    pos = {"xyz:TST": Position("xyz:TST", Dd(-10), Dd(100), Dd(100), liquidation_price=Dd(103), margin_mode="isolated")}
+    eng = FakeEngine({"arcus": acct("arcus", 9000, 0, {}), "hl:xyz": acct("hl:xyz", 0, 0, pos)})
+    RiskManager(cfg, eng).evaluate()
+    assert eng.venues["hl:xyz"].added == []
     assert eng.reductions and eng.reductions[0][0] == "T"
 
 

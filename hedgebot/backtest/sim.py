@@ -66,6 +66,10 @@ class BacktestParams:
     margin_ratio_critical: float = 1.7
     derisk_fraction: float = 0.3
     isolated_liq_buffer_critical_pct: float = 4
+    isolated_liq_buffer_warn_pct: float = 8
+    isolated_topup_enabled: bool = True
+    isolated_topup_target_pct: float = 15
+    rotation_enabled: bool = True  # False disables rotation for every pair (hold-only variant)
     max_account_leverage: float = 5
     hedge_slippage_bps: float = 0.3
     maker_adverse_bps: float = 0.5
@@ -98,6 +102,8 @@ class PairResult:
     derisks: int = 0
     stops: int = 0
     liquidations: int = 0
+    topups: int = 0
+    topup_usd: float = 0.0
     oi_hours: float = 0.0
     final_qty: float = 0.0
     direction_changes: list[tuple[int, int]] = field(default_factory=list)
@@ -115,6 +121,7 @@ class BacktestResult:
     transfers: int
     transfer_usd: float
     daily_equity: list[tuple[int, dict[str, float]]]
+    groups: dict[str, str] = field(default_factory=dict)
 
     @property
     def days(self) -> float:
@@ -180,6 +187,14 @@ class BacktestResult:
         return sum(p.stops for p in self.pairs.values())
 
     @property
+    def topups(self) -> int:
+        return sum(p.topups for p in self.pairs.values())
+
+    @property
+    def topup_usd(self) -> float:
+        return sum(p.topup_usd for p in self.pairs.values())
+
+    @property
     def rotations(self) -> int:
         return sum(p.rotations for p in self.pairs.values())
 
@@ -195,6 +210,17 @@ class _Pair:
         self.ratio = float(data.pair.hedge_ratio)
         self.notional = float(data.pair.notional_usd) * params.notional_scale
         self.leverage = params.leverage_override or float(data.pair.leverage)
+        pc = data.pair
+        self.rotate = params.rotation_enabled and pc.rotate
+        self.min_hold_h = pc.min_hold_h if pc.min_hold_h is not None else params.min_hold_h
+        self.max_hold_h = pc.max_hold_h if pc.max_hold_h is not None else params.max_hold_h
+        self.frac_min = float(pc.rotation_fraction_min) if pc.rotation_fraction_min is not None \
+            else params.rotation_fraction_min
+        self.frac_max = float(pc.rotation_fraction_max) if pc.rotation_fraction_max is not None \
+            else params.rotation_fraction_max
+        self.rotate_when = pc.rotate_when or params.rotate_when
+        self.iso_m = 0.0  # isolated margin posted to each leg (when that leg's market is isolated)
+        self.iso_h = 0.0
         self.m_idx = _align(data.maker.t, timeline)
         self.h_idx = _align(data.hedge.t, timeline)
         self.direction = 0
@@ -225,6 +251,14 @@ class _Pair:
         """Both legs printed a bar at this step (no forward-filled stale close)."""
         t = timeline[i]
         return self.data.maker.t[self.m_idx[i]] == t and self.data.hedge.t[self.h_idx[i]] == t
+
+
+def _iso_liq(size: float, entry: float, margin: float, mmf: float) -> float | None:
+    """Liquidation price of an isolated position (see venues.arcus.isolated_liquidation_price)."""
+    if size == 0 or margin <= 0:
+        return None
+    denom = size * (1 - mmf) if size > 0 else size * (1 + mmf)
+    return max((size * entry - margin) / denom, 0.0)
 
 
 def _align(series_t: list[int], timeline: list[int]) -> list[int]:
@@ -287,7 +321,10 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
             notional = abs(size) * (mc if is_maker else hc)
             gross += notional
             maint += notional * spec.mmf
-            initial += notional / leg_lev(p, spec, venue, new_risk)
+            if spec.isolated:
+                initial += p.iso_m if is_maker else p.iso_h
+            else:
+                initial += notional / leg_lev(p, spec, venue, new_risk)
         return gross, maint, initial
 
     def addable(venue: str, p: "_Pair", i: int) -> float:
@@ -337,6 +374,26 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
             p.res.maker_volume_off_hours += m_notional
         p.res.hedge_volume += h_notional
         new_qty = p.qty + delta
+        for is_maker, spec, venue, old_sz, new_sz, px in (
+            (True, p.ms, p.mv, p.qty, new_qty, mc),
+            (False, p.hs, p.hv, -p.qty * p.ratio, -new_qty * p.ratio, hc),
+        ):
+            if not spec.isolated:
+                continue
+            m = p.iso_m if is_maker else p.iso_h
+            lev = leg_lev(p, spec, venue, False)
+            if new_sz == 0:
+                m = 0.0
+            elif old_sz == 0 or (old_sz > 0) != (new_sz > 0):
+                m = abs(new_sz) * px / lev
+            elif abs(new_sz) > abs(old_sz):
+                m += (abs(new_sz) - abs(old_sz)) * px / lev
+            else:
+                m *= abs(new_sz) / abs(old_sz)
+            if is_maker:
+                p.iso_m = m
+            else:
+                p.iso_h = m
         if p.qty == 0 or (p.qty > 0) == (delta > 0):
             if new_qty:
                 p.entry_m = (p.entry_m * abs(p.qty) + mc * abs(delta)) / abs(new_qty)
@@ -350,7 +407,7 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
         p.target = p.qty
         p.phase = "hold"
         p.derisk_until = t + 6 * HOUR_MS
-        p.next_rot = t + int(rng.uniform(params.min_hold_h, params.max_hold_h) * HOUR_MS)
+        p.next_rot = t + int(rng.uniform(p.min_hold_h, p.max_hold_h) * HOUR_MS)
         p.res.derisks += 1
 
     def liquidate(p: "_Pair", maker_leg: bool, extreme: float, i: int, t: int, stop: bool = False) -> None:
@@ -370,6 +427,7 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
         equity[other_venue] -= cost
         p.res.fees += cost
         p.qty = 0.0
+        p.iso_m = p.iso_h = 0.0
         p.phase = "build"
         p.direction = 0
         p.derisk_until = t + int((params.stop_cooldown_h if stop else 6) * HOUR_MS)
@@ -408,26 +466,47 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
                     p.res.funding += pay_m + pay_h
             p.prev_t, p.prev_m, p.prev_h = t, mc, hc
 
-        # 2) isolated legs: liquidation / de-risk on the bar's adverse extreme
+        # 2) isolated legs: exchange stop / liquidation on the bar's adverse extreme, then top-up or de-risk
         for p in pairs:
             if not p.active(i) or not p.qty:
                 continue
-            (mh, ml, _), (hh, hl, _) = p.bar(i)
-            for maker_leg, spec, venue, size, entry, extreme in (
-                (True, p.ms, p.mv, p.qty, p.entry_m, ml if p.qty > 0 else mh),
-                (False, p.hs, p.hv, -p.qty * p.ratio, p.entry_h, hl if p.qty < 0 else hh),
+            (mh, ml, mc), (hh, hl, hc) = p.bar(i)
+            for maker_leg, spec, venue, size, entry, extreme, close in (
+                (True, p.ms, p.mv, p.qty, p.entry_m, ml if p.qty > 0 else mh, mc),
+                (False, p.hs, p.hv, -p.qty * p.ratio, p.entry_h, hl if p.qty < 0 else hh, hc),
             ):
                 if not spec.isolated or entry <= 0 or not p.qty:
                     continue
-                lev = leg_lev(p, spec, venue, False)
-                adverse = (entry - extreme) / entry if size > 0 else (extreme - entry) / entry
-                buffer = 1 / lev - spec.mmf
-                stop_at = buffer - params.backstop_isolated_buffer_pct / 100
-                if params.backstop_enabled and adverse >= stop_at:
+                margin = p.iso_m if maker_leg else p.iso_h
+                liq = _iso_liq(size, entry, margin, spec.mmf)
+                if liq is None:
+                    continue
+                worst = (extreme - liq) / extreme if size > 0 else (liq - extreme) / extreme
+                if params.backstop_enabled and worst <= params.backstop_isolated_buffer_pct / 100:
                     liquidate(p, maker_leg, extreme, i, t, stop=True)
-                elif adverse >= buffer:
+                    continue
+                if worst <= 0:
                     liquidate(p, maker_leg, extreme, i, t)
-                elif (buffer - adverse) * 100 < params.isolated_liq_buffer_critical_pct and t >= p.derisk_until:
+                    continue
+                dist = (close - liq) / close if size > 0 else (liq - close) / close
+                if dist * 100 < params.isolated_liq_buffer_warn_pct and params.isolated_topup_enabled:
+                    target = params.isolated_topup_target_pct / 100
+                    if size > 0:
+                        need = (liq - close * (1 - target)) * size * (1 - spec.mmf)
+                    else:
+                        need = (close * (1 + target) - liq) * abs(size) * (1 + spec.mmf)
+                    free = equity[venue] - margin_state(venue, i)[2]
+                    add = min(need, free * 0.95)
+                    if add >= 5:
+                        if maker_leg:
+                            p.iso_m += add
+                        else:
+                            p.iso_h += add
+                        p.res.topups += 1
+                        p.res.topup_usd += add
+                        liq = _iso_liq(size, entry, margin + add, spec.mmf)
+                        dist = (close - liq) / close if size > 0 else (liq - close) / close
+                if dist * 100 < params.isolated_liq_buffer_critical_pct and t >= p.derisk_until:
                     derisk(p, i, t)
 
         # 3) cross accounts: worst equity inside the bar versus maintenance
@@ -511,7 +590,7 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
                     continue
                 if p.target and abs(p.qty / p.target - 1) <= tol:
                     p.phase = "hold"
-                    p.next_rot = t + int(rng.uniform(params.min_hold_h, params.max_hold_h) * HOUR_MS)
+                    p.next_rot = t + int(rng.uniform(p.min_hold_h, p.max_hold_h) * HOUR_MS)
                     continue
                 gap = p.target - p.qty
                 side = 1 if gap > 0 else -1
@@ -527,7 +606,7 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
                     p.phase = "build"
                     p.target = p.direction * p.notional / mc
                     continue
-                if t < p.next_rot or not strategy.rotation_window_open(params.rotate_when, off):
+                if not p.rotate or t < p.next_rot or not strategy.rotation_window_open(p.rotate_when, off):
                     continue
                 if day_cost.get(day, 0.0) >= params.max_daily_cost_usd:
                     p.next_rot = t + HOUR_MS // 2
@@ -535,7 +614,7 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
                 flip = p.cfg.direction == "auto" and strategy.should_flip(
                     p.direction, _trailing_avg(p.data.maker_funding, t, fwin), _trailing_avg(p.data.hedge_funding, t, fwin),
                     params.flip_carry_apr)
-                frac = 1.0 if flip else rng.uniform(params.rotation_fraction_min, params.rotation_fraction_max)
+                frac = 1.0 if flip else rng.uniform(p.frac_min, p.frac_max)
                 if not guard_ok(-1 if p.qty > 0 else 1):
                     p.next_rot = t + HOUR_MS // 4
                     continue
@@ -563,4 +642,5 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
         transfers=totals["transfers"],
         transfer_usd=totals["transfer_usd"],
         daily_equity=daily,
+        groups={p.name: p.cfg.group for p in pairs},
     )

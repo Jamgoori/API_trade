@@ -45,6 +45,7 @@ def format_result(res: BacktestResult) -> str:
         f"    de-risk / stops / liq  {res.derisks} / {res.stops} / {res.liquidations}",
         f"    min margin ratio       " + ", ".join(f"{v} {r:.2f}" for v, r in res.min_margin_ratio.items()),
         f"    venue transfers needed {res.transfers}  (${res.transfer_usd:,.0f} moved)",
+        f"    isolated top-ups       {res.topups}  (${res.topup_usd:,.0f} moved into Entropy positions)",
         "",
         "  Per pair",
         f"    {'pair':<14}{'maker vol':>12}{'off-hrs':>8}{'fees':>9}{'slip':>9}{'funding':>10}{'rot':>5}{'derisk':>7}"
@@ -54,6 +55,18 @@ def format_result(res: BacktestResult) -> str:
         share = r.maker_volume_off_hours / r.maker_volume if r.maker_volume else 0
         lines.append(f"    {r.name:<14}{r.maker_volume:>12,.0f}{share:>8.0%}{r.fees:>9,.2f}{r.slippage:>9,.2f}"
                      f"{r.funding:>10,.2f}{r.rotations:>5}{r.derisks:>7}{r.stops:>5}{r.liquidations:>4}")
+    groups: dict[str, list] = {}
+    for name, r in res.pairs.items():
+        groups.setdefault(res.groups.get(name) or "-", []).append(r)
+    if len(groups) > 1 or "-" not in groups:
+        lines.append("")
+        lines.append("  Per group (volume per day: Arcus leg / hedge leg)")
+        for g, rs in groups.items():
+            mv = sum(r.maker_volume for r in rs) / days
+            hv = sum(r.hedge_volume for r in rs) / days
+            cost = sum(r.fees + r.slippage - r.funding for r in rs)
+            lines.append(f"    {g:<6} ${mv:>10,.0f} / ${hv:>10,.0f}   net cost ${cost:,.2f}  "
+                         f"(fees+spread-funding), avg OI ${sum(r.oi_hours for r in rs) / (days * 24):,.0f}")
     lines.append("")
     lines.append("  Equity by venue (end of day, UTC)")
     venues = list(res.start_equity)

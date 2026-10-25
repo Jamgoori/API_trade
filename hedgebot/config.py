@@ -32,6 +32,35 @@ class PairConfig:
     direction: str = "auto"
     hedge_ratio: Decimal = Decimal(1)  # hedge qty per 1 unit of maker qty (1 for the same ticker)
     enabled: bool = True
+    group: str = ""  # label for reports and capital planning, e.g. rwa / io
+    # Per-pair rotation overrides (None = use the strategy section). rotate: false = hold only.
+    rotate: bool = True
+    min_hold_h: float | None = None
+    max_hold_h: float | None = None
+    rotation_fraction_min: Decimal | None = None
+    rotation_fraction_max: Decimal | None = None
+    rotate_when: str | None = None
+
+
+@dataclass(frozen=True)
+class Rotation:
+    enabled: bool
+    min_hold_h: float
+    max_hold_h: float
+    fraction_min: Decimal
+    fraction_max: Decimal
+    window: str
+
+
+def pair_rotation(pair: PairConfig, s: "StrategyConfig") -> Rotation:
+    return Rotation(
+        enabled=pair.rotate,
+        min_hold_h=pair.min_hold_h if pair.min_hold_h is not None else s.min_hold_h,
+        max_hold_h=pair.max_hold_h if pair.max_hold_h is not None else s.max_hold_h,
+        fraction_min=pair.rotation_fraction_min if pair.rotation_fraction_min is not None else s.rotation_fraction_min,
+        fraction_max=pair.rotation_fraction_max if pair.rotation_fraction_max is not None else s.rotation_fraction_max,
+        window=pair.rotate_when or s.rotate_when,
+    )
 
 
 @dataclass
@@ -107,6 +136,10 @@ class RiskConfig:
     # After a leg is closed outside the bot (stop, liquidation): stay flat this long, then rebuild
     # only if margin allows. 0 = never rebuild automatically.
     stop_cooldown_h: float = 6
+    # Isolated positions (Entropy): when the liquidation buffer falls below isolated_liq_buffer_warn_pct,
+    # move free collateral of that venue into the position until the buffer is back to this level.
+    isolated_topup_enabled: bool = True
+    isolated_topup_target_pct: Decimal = Decimal(15)
     max_account_leverage: Decimal = Decimal(5)
     max_daily_loss_pct: Decimal = Decimal(2)
     stale_data_s: float = 20
@@ -263,6 +296,13 @@ def validate(cfg: Config) -> None:
                 raise ConfigError(f"pair {p.name}: unknown venue {leg.venue} (use arcus, hl:xyz, hl:io)")
         if p.maker.venue == p.hedge.venue and p.maker.symbol == p.hedge.symbol:
             raise ConfigError(f"pair {p.name}: both legs are the same market")
+        rot = pair_rotation(p, cfg.strategy)
+        if not (0 < rot.min_hold_h <= rot.max_hold_h):
+            raise ConfigError(f"pair {p.name}: need 0 < min_hold_h <= max_hold_h")
+        if not (0 < rot.fraction_min <= rot.fraction_max <= 1):
+            raise ConfigError(f"pair {p.name}: rotation fractions must satisfy 0 < min <= max <= 1")
+        if rot.window not in ("off_hours", "any"):
+            raise ConfigError(f"pair {p.name}: rotate_when must be off_hours or any")
     s = cfg.strategy
     if not (0 < s.clip_usd_min <= s.clip_usd_max):
         raise ConfigError("strategy: need 0 < clip_usd_min <= clip_usd_max")
@@ -281,6 +321,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError("risk: need 1 < margin_ratio_critical < margin_ratio_warn")
     if not (1 < r.backstop_margin_ratio < r.margin_ratio_critical):
         raise ConfigError("risk: need 1 < backstop_margin_ratio < margin_ratio_critical")
+    if r.isolated_topup_target_pct <= r.isolated_liq_buffer_warn_pct:
+        raise ConfigError("risk: isolated_topup_target_pct must be above isolated_liq_buffer_warn_pct")
     if not (0 < r.backstop_isolated_buffer_pct < r.isolated_liq_buffer_critical_pct):
         raise ConfigError("risk: need 0 < backstop_isolated_buffer_pct < isolated_liq_buffer_critical_pct")
     if not cfg.execution.hedge_slippage_bps:

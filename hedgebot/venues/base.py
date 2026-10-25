@@ -165,6 +165,10 @@ class Venue(ABC):
     def set_leverage(self, symbol: str, leverage: int, cross: bool) -> None:
         raise VenueError(f"{self.name}: trading needs credentials")
 
+    def add_isolated_margin(self, symbol: str, amount: Decimal) -> None:
+        """Move `amount` USD of free collateral into an isolated position."""
+        raise VenueError(f"{self.name}: adding isolated margin is not supported here")
+
     def place_stop(self, symbol: str, side: Side, size: Decimal, trigger: Decimal) -> OrderState:
         """Reduce-only stop-market that rests on the venue: the backstop when the bot is not running.
 

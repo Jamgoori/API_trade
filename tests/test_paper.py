@@ -90,3 +90,15 @@ def test_state_survives_restart(tmp_path):
     v.place_order("TST-USD", Side.BUY, Dd(3), Dd("100.02"), Tif.IOC)
     v2 = PaperVenue(data, Dd(999), state_dir=tmp_path)
     assert v2.positions["TST-USD"].size == 3 and v2.cash == v.cash
+
+
+def test_isolated_top_up_moves_liquidation_and_survives_adds(tmp_path):
+    v, data = venue(tmp_path, isolated_only=True, maintenance_margin_fraction=Dd("0.05"))
+    v.set_leverage("TST-USD", 2, cross=False)
+    v.place_order("TST-USD", Side.BUY, Dd(10), Dd("100.02"), Tif.IOC)
+    liq_before = v.account().positions["TST-USD"].liquidation_price
+    v.add_isolated_margin("TST-USD", Dd(200))
+    liq_after = v.account().positions["TST-USD"].liquidation_price
+    assert liq_after < liq_before
+    v.place_order("TST-USD", Side.BUY, Dd(2), Dd("100.02"), Tif.IOC)  # adding keeps the top-up
+    assert v.positions["TST-USD"].isolated_margin > Dd(12) * Dd("100.01") / 2

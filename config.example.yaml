@@ -6,11 +6,14 @@
 
 mode: paper            # paper(실시세 모의) | testnet | live
 
-# 거래소별 자금. paper 모드에서는 모의 잔고로 쓰입니다.
+# 자금 배분 (총 $14,000 예시)
+#   RWA 작업 25% ($3,500)  = Arcus $1,750 + trade.xyz $1,750   -> Arcus RWA 종목을 trade.xyz 로 헤지
+#   io 작업  75% ($10,500) = Entropy $5,250 + Arcus $5,250     -> Entropy 종목을 Arcus 로 헤지, 포지션 유지 위주
+# paper 모드에서는 이 금액이 모의 잔고입니다.
 capital:
-  arcus: 8000          # USDG
-  hl:xyz: 3000         # USDC (trade.xyz 증거금 계정)
-  hl:io: 3000          # USDC (Entropy 증거금 계정, 격리 전용이라 여유 있게)
+  arcus: 7000          # USDG  (RWA 1,750 + io 헤지 5,250)
+  hl:xyz: 1750         # USDC  trade.xyz 증거금 계정 (RWA 헤지 전용)
+  hl:io: 5250          # USDC  Entropy 증거금 계정. 격리 전용이라 증거금 4,000 + 자동 보충용 여유 1,250
 
 arcus:
   account_index: 0     # 봇 전용 서브계정을 권장합니다 (API 키 발급 시 Subaccount # 선택)
@@ -23,37 +26,67 @@ hyperliquid:
   base_taker_fee: 0.00045
   margin_mode: cross   # Entropy(io) 는 격리 전용이라 자동으로 격리증거금이 됩니다
 
-# 페어: maker = 메이커 주문을 거는 쪽(Arcus RWA 메이커 수수료 0%), hedge = 체결 즉시 테이커로 헤지하는 쪽
-# direction: auto 는 펀딩비 차이가 의미 있으면 펀딩을 받는 방향, 아니면 Arcus 안에서 롱/숏이 상쇄되도록 번갈아 배치
+# 페어: maker = 메이커 주문을 거는 쪽(Arcus RWA 메이커 수수료 0%), hedge = 체결 즉시 반대로 잡는 쪽.
+# 헤지된 페어는 양쪽 거래량이 같아서, Arcus 를 메이커로 두어도 Entropy 거래량은 똑같이 쌓이고 비용은 가장 쌉니다.
+# direction: auto 는 펀딩비 차이가 의미 있으면 펀딩을 받는 방향, 아니면 같은 거래소 안에서 롱/숏이 상쇄되게 배치.
+# 페어별로 min_hold_h / max_hold_h / rotation_fraction_min / rotation_fraction_max / rotate_when 을 덮어쓸 수 있고,
+# rotate: false 면 회전 없이 보유만 합니다.
 pairs:
+  # ---------------- RWA 작업 (25%): Arcus <-> trade.xyz ----------------
   - name: NVDA
+    group: rwa
     maker: {venue: arcus, symbol: NVDA-USD}
     hedge: {venue: "hl:xyz", symbol: "xyz:NVDA"}
-    notional_usd: 7000
-    leverage: 5
+    notional_usd: 3000
+    leverage: 3
     direction: auto
 
   - name: TSLA
+    group: rwa
     maker: {venue: arcus, symbol: TSLA-USD}
     hedge: {venue: "hl:xyz", symbol: "xyz:TSLA"}
-    notional_usd: 5000
-    leverage: 5
+    notional_usd: 2000
+    leverage: 3
     direction: auto
 
-  # --- Entropy 활동용 (Arcus 와 겹치는 종목은 SNDK / DRAM / NBIS 뿐) ---
-  - name: SNDK-entropy
+  # ---------------- io 작업 (75%): Arcus <-> Entropy, 보유 위주 ----------------
+  # Arcus 와 Entropy 에 모두 있는 종목은 SNDK / DRAM / NBIS 뿐입니다.
+  # 하루~이틀마다 20~40% 만 회전해서 Entropy 30일 거래량을 유지합니다. 보유만 하려면 rotate: false.
+  - name: SNDK-io
+    group: io
     maker: {venue: arcus, symbol: SNDK-USD}
     hedge: {venue: "hl:io", symbol: "io:SNDK"}
-    notional_usd: 4000
-    leverage: 2        # Entropy 는 격리 전용이라 다른 계정 돈으로 버틸 수 없음. 백테스트상 4배는 청산 발생
+    notional_usd: 5000
+    leverage: 2        # Entropy 격리 2배: 청산까지 약 47%, 경고 시 여유 잔고로 자동 보충
     direction: auto
+    min_hold_h: 24
+    max_hold_h: 48
+    rotation_fraction_min: 0.2
+    rotation_fraction_max: 0.4
 
-  - name: DRAM-entropy
+  - name: DRAM-io
+    group: io
     maker: {venue: arcus, symbol: DRAM-USD}
     hedge: {venue: "hl:io", symbol: "io:DRAM"}
-    notional_usd: 2000
+    notional_usd: 1500
     leverage: 2
     direction: auto
+    min_hold_h: 24
+    max_hold_h: 48
+    rotation_fraction_min: 0.2
+    rotation_fraction_max: 0.4
+
+  - name: NBIS-io
+    group: io
+    maker: {venue: arcus, symbol: NBIS-USD}
+    hedge: {venue: "hl:io", symbol: "io:NBIS"}
+    notional_usd: 1500
+    leverage: 2
+    direction: auto
+    min_hold_h: 24
+    max_hold_h: 48
+    rotation_fraction_min: 0.2
+    rotation_fraction_max: 0.4
 
 strategy:
   clip_usd_min: 600        # 한 번에 거는 메이커 주문 크기 (랜덤)
@@ -102,6 +135,8 @@ risk:
   backstop_isolated_buffer_pct: 2    # 격리 포지션은 청산가 2% 앞에 손절
   backstop_refresh_s: 60
   stop_cooldown_h: 6                 # 손절/청산으로 한쪽이 닫히면 반대쪽도 정리 후 6시간 쉬고 재진입 (0 = 재진입 안 함)
+  isolated_topup_enabled: true       # 격리 포지션(Entropy)이 청산가 8% 이내로 오면 그 계정의 여유 잔고로 증거금 보충
+  isolated_topup_target_pct: 15      # 보충 후 청산가까지 거리
   max_account_leverage: 5           # 거래소 계정 전체 명목가 / 자산 상한
   max_daily_loss_pct: 2             # 하루 손실이 전체 자산의 2% 넘으면 신규 진입/회전 중단
   stale_data_s: 20

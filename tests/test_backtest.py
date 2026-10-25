@@ -101,3 +101,24 @@ def test_transfers_rebalance_venues_on_slow_drift():
                        d.maker.t[0], d.maker.t[-1])
     assert res.transfers >= 1
     assert res.liquidations == 0
+
+
+def test_isolated_top_up_keeps_a_trending_position_alive():
+    from dataclasses import replace as dc_replace
+    trend = lambda i: 100.0 + i * 0.25  # +50% over the run against the short hedge
+    d = make(n=200, maker_px=trend, hedge_px=trend, notional=4000, direction="long_maker")
+    iso = dict(params().leg_specs)
+    iso[("hl:xyz", "xyz:A")] = dc_replace(iso[("hl:xyz", "xyz:A")], isolated=True)
+    base = dict(capital={"arcus": 6000.0, "hl:xyz": 6000.0}, leg_specs=iso, min_hold_h=1e6, max_hold_h=1e6)
+    d.pair.leverage = 2
+    with_topup = run_backtest([d], params(**base), d.maker.t[0], d.maker.t[-1])
+    without = run_backtest([d], params(**base, isolated_topup_enabled=False), d.maker.t[0], d.maker.t[-1])
+    assert with_topup.topups >= 1 and with_topup.stops == 0 and with_topup.liquidations == 0
+    assert without.stops + without.derisks + without.liquidations >= 1
+
+
+def test_pair_level_rotation_off():
+    d = make(n=4 * 40)
+    d.pair.rotate = False
+    res = run_backtest([d], params(min_hold_h=1, max_hold_h=1, max_daily_cost_usd=1e9), d.maker.t[0], d.maker.t[-1])
+    assert res.rotations == 0

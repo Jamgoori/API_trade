@@ -144,6 +144,8 @@ def cmd_backtest(args) -> int:
         margin_ratio_warn=float(r.margin_ratio_warn), margin_ratio_critical=float(r.margin_ratio_critical),
         derisk_fraction=float(r.derisk_fraction),
         isolated_liq_buffer_critical_pct=float(r.isolated_liq_buffer_critical_pct),
+        isolated_liq_buffer_warn_pct=float(r.isolated_liq_buffer_warn_pct),
+        isolated_topup_enabled=r.isolated_topup_enabled, isolated_topup_target_pct=float(r.isolated_topup_target_pct),
         max_account_leverage=float(r.max_account_leverage),
         allow_transfers=not args.no_transfers,
         backstop_enabled=r.backstop_enabled, backstop_margin_ratio=float(r.backstop_margin_ratio),
@@ -157,9 +159,9 @@ def cmd_backtest(args) -> int:
         return 0
     variants = [
         base,
-        replace(base, label="hold only (no rotation)", min_hold_h=1e6, max_hold_h=1e6),
-        replace(base, label="rotate 1.5-4h", min_hold_h=1.5, max_hold_h=4),
-        replace(base, label="rotate 8-16h", min_hold_h=8, max_hold_h=16),
+        replace(base, label="hold only (no rotation)", rotation_enabled=False),
+        replace(base, label="rotate 1.5-4h*", min_hold_h=1.5, max_hold_h=4),
+        replace(base, label="rotate 8-16h*", min_hold_h=8, max_hold_h=16),
         replace(base, label="rotate any time", rotate_when="any"),
         replace(base, label="notional x1.5", notional_scale=1.5),
         replace(base, label="notional x0.6", notional_scale=0.6),
@@ -167,14 +169,16 @@ def cmd_backtest(args) -> int:
         replace(base, label="budget x3", max_daily_cost_usd=base.max_daily_cost_usd * 3),
         replace(base, label="no transfers", allow_transfers=False),
         replace(base, label="no exchange stops", backstop_enabled=False),
+        replace(base, label="no isolated top-up", isolated_topup_enabled=False),
         replace(base, label="taker hedge", passive_hedge_fill_rate=0.0) if base.passive_hedge_fill_rate else
         replace(base, label="passive hedge 50% fills", passive_hedge_fill_rate=0.5),
-        replace(base, label="passive hedge 50% + 8-16h", passive_hedge_fill_rate=base.passive_hedge_fill_rate or 0.5,
+        replace(base, label="passive hedge 50% + 8-16h*", passive_hedge_fill_rate=base.passive_hedge_fill_rate or 0.5,
                 min_hold_h=8, max_hold_h=16),
     ]
     results = [run_backtest(datas, v, start_ms, end_ms) for v in variants]
     print()
     print(format_sweep(results))
+    print("* applies to pairs without their own min_hold_h / max_hold_h in config")
     print()
     print(format_result(results[0]))
     return 0

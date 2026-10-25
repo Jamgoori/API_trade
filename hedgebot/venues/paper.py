@@ -310,7 +310,12 @@ class PaperVenue(Venue):
         isolated_margin = ZERO
         if self._is_isolated(order.symbol) and new_size != 0:
             lev = self._effective_leverage(order.symbol, new_risk=False)
-            isolated_margin = abs(new_size) * entry / lev
+            if pos.size == 0 or (new_size > 0) != (pos.size > 0):
+                isolated_margin = abs(new_size) * entry / lev  # fresh (or flipped) position
+            elif abs(new_size) > abs(pos.size):
+                isolated_margin = pos.isolated_margin + size * price / lev  # adding keeps earlier top-ups
+            else:
+                isolated_margin = pos.isolated_margin * abs(new_size) / abs(pos.size)  # pro-rata release
         self.cash += realized - fee
         self.fees_paid += fee
         if new_size == 0:
@@ -379,6 +384,15 @@ class PaperVenue(Venue):
     def cancel_all(self) -> None:
         for order_id in list(self.orders):
             self.cancel_order("", order_id)
+
+    def add_isolated_margin(self, symbol: str, amount: Decimal) -> None:
+        pos = self.positions.get(symbol)
+        if pos is None or not pos.isolated:
+            raise VenueError(f"{self.name}: no isolated position in {symbol}")
+        if self.account().free_collateral < amount:
+            raise VenueError(f"{self.name}: not enough free collateral to add {amount}")
+        pos.isolated_margin += D(amount)
+        self._save()
 
     def set_leverage(self, symbol: str, leverage: int, cross: bool) -> None:
         info = self.market(symbol)

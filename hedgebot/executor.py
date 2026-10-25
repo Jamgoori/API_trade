@@ -24,7 +24,7 @@ from enum import Enum
 from typing import Protocol
 
 from . import strategy
-from .config import Config, PairConfig
+from .config import Config, PairConfig, pair_rotation
 from .marketcal import minutes_to_session_boundary
 from .models import BBO, AccountState, MarketInfo, OrderState, OrderStatus, Side, Tif
 from .util import D, ZERO, now_ms
@@ -149,6 +149,7 @@ class PairExecutor:
         self.maker: Venue = ctx.venues[pair.maker.venue]
         self.hedge: Venue = ctx.venues[pair.hedge.venue]
         self.ratio = D(pair.hedge_ratio)
+        self.rotation = pair_rotation(pair, ctx.cfg.strategy)
         self.rt = Runtime()
         self.clip: Clip | None = None
         self.stats = PairStats()
@@ -258,7 +259,7 @@ class PairExecutor:
         if phase is Phase.BUILD:
             if strategy.at_target(pos, target, tol):
                 self.rt.phase = Phase.HOLD.value
-                self.rt.next_rotation_ts = now + strategy.next_rotation_delay_s(s.min_hold_h, s.max_hold_h, self.rng)
+                self.rt.next_rotation_ts = now + self._hold_delay()
                 self.ctx.event("info", "built", f"{self.name}: at target {pos}", pair=self.name)
                 self.persist()
                 return None
@@ -272,9 +273,9 @@ class PairExecutor:
                 self._retarget(snap)
                 self.persist()
                 return self.rt.target
-            if now < self.rt.next_rotation_ts or self.ctx.halted:
+            if not self.rotation.enabled or now < self.rt.next_rotation_ts or self.ctx.halted:
                 return None
-            if not strategy.rotation_window_open(s.rotate_when, snap.maker_mkt.outside_rth):
+            if not strategy.rotation_window_open(self.rotation.window, snap.maker_mkt.outside_rth):
                 return None
             if not self.ctx.rotation_budget_left():
                 self.rt.next_rotation_ts = now + 1800
@@ -288,7 +289,8 @@ class PairExecutor:
                 self.ctx.funding_avg(self.pair.hedge.venue, self.pair.hedge.symbol),
                 s.flip_carry_apr,
             )
-            fraction = D(1) if flip else strategy.rotation_fraction(s.rotation_fraction_min, s.rotation_fraction_max, self.rng)
+            fraction = D(1) if flip else strategy.rotation_fraction(self.rotation.fraction_min,
+                                                                  self.rotation.fraction_max, self.rng)
             unwind_to = self.maker.round_size(self.pair.maker.symbol, abs(pos) * (1 - fraction)) * (1 if pos > 0 else -1)
             self.rt.unwind_to = str(unwind_to)
             self.rt.flip_pending = flip
@@ -412,8 +414,7 @@ class PairExecutor:
         self.rt.derisk_until = now + 6 * 3600
         self.rt.target_qty = str(pos + side.sign * qty)
         self.rt.phase = Phase.HOLD.value
-        self.rt.next_rotation_ts = now + strategy.next_rotation_delay_s(
-            self.cfg.strategy.min_hold_h, self.cfg.strategy.max_hold_h, self.rng)
+        self.rt.next_rotation_ts = now + self._hold_delay()
         self.persist()
         self.ctx.event("error", "derisk", f"{self.name}: risk reduction {fraction:.0%} ({side.value} {qty})",
                        pair=self.name, notify=True)
@@ -421,6 +422,9 @@ class PairExecutor:
             self._on_reject(order, now)
             return
         self.clip = Clip("derisk", side, side.opposite(), order, bbo.mid, snap.maker_mkt.outside_rth, urgent=True)
+
+    def _hold_delay(self) -> float:
+        return strategy.next_rotation_delay_s(self.rotation.min_hold_h, self.rotation.max_hold_h, self.rng)
 
     def _on_reject(self, order: OrderState, now: float) -> None:
         reason = order.reject_reason or "rejected"
@@ -752,7 +756,7 @@ class PairExecutor:
             "direction": self.rt.direction,
             "target": self.rt.target_qty,
             "next_rotation_in_min": round(max(0.0, self.rt.next_rotation_ts - time.time()) / 60, 1)
-            if self.rt.phase == Phase.HOLD.value else None,
+            if self.rt.phase == Phase.HOLD.value and self.rotation.enabled else None,
             "rotations": self.rt.rotations_done,
             "busy": self.busy,
             "stats": asdict(self.stats),

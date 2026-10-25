@@ -319,6 +319,14 @@ class HyperliquidVenue(Venue):
         for o in rows:
             self.cancel_order(o["coin"], str(o["oid"]))
 
+    def add_isolated_margin(self, symbol: str, amount: Decimal) -> None:
+        try:
+            resp = self.client.exchange.update_isolated_margin(float(amount), symbol)
+        except Exception as exc:
+            raise VenueError(f"{self.name} add margin {symbol}: {exc}", retryable=True) from exc
+        if resp.get("status") != "ok":
+            raise VenueError(f"{self.name} add margin {symbol}: {resp}", payload=resp)
+
     def place_stop(self, symbol: str, side: Side, size: Decimal, trigger: Decimal) -> OrderState:
         """Reduce-only stop-market trigger order (sized; refreshed by the backstop manager)."""
         trigger = self.round_price(symbol, D(trigger), "nearest")
