@@ -1,0 +1,23 @@
+# deploy/install.sh 가 @REPO@ / @USER@ 를 채워 /etc/systemd/system/hedgebot.service 로 설치합니다.
+[Unit]
+Description=hedgebot (Arcus <-> Hyperliquid hedge points bot)
+After=network-online.target
+Wants=network-online.target
+# 설정 오류처럼 계속 죽는 경우 10분에 5번까지만 재시작 (텔레그램으로 'stopped' 알림이 갑니다)
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@REPO@
+ExecStart=@REPO@/.venv/bin/hedgebot run --mode live --i-understand-live
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=30
+# 종료 시 봇이 메이커 주문을 취소하고 체결분을 헤지할 시간을 줍니다 (거래소 손절은 그대로 남음)
+KillSignal=SIGTERM
+TimeoutStopSec=150
+
+[Install]
+WantedBy=multi-user.target

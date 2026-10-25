@@ -151,7 +151,7 @@ def test_position_stop_uses_untriggered_op_and_position_grouping():
     v.http = CaptureHttp(Resp(202, {"responses": [{"orderId": "bb01", "status": "ACK", "clientTime": 1,
                                                     "marketId": 28, "marketDisplayName": "NVDA-USD"}]}))
     st = v.place_stop("NVDA-USD", Side.SELL, Decimal("5"), Decimal("180.004"))
-    assert st.status is OrderStatus.OPEN and st.order_id == "bb01" and st.trigger_price == Decimal("180.00")
+    assert st.status is OrderStatus.PENDING and st.order_id == "bb01" and st.trigger_price == Decimal("180.00")
     _, path, kw = v.http.calls[0]
     assert path == "/v1/batchPlaceOrders"
     body = json.loads(kw["data"])

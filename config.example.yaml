@@ -12,7 +12,8 @@ mode: paper            # paper(실시세 모의) | testnet | live
 #   Entropy 목표 $27k (5배 기준 증거금 $5.4k). 나머지 $2.6k 는 노는 돈이 아니라 청산가에 가까워지면
 #   자동으로 격리증거금에 넣는 보충분입니다. 크기의 한계는 Arcus 증거금(RWA + Entropy 헤지를 같이 받침).
 #   3일마다 리밸런싱 전제. 백테스트(45일): Entropy OI 평균 $25.7k, 손익 +$104, 청산가 최근접 6.9%, Arcus 증거금 비율 최저 2.76
-# paper 모드에서는 이 금액이 모의 잔고입니다.
+# paper 모드에서는 이 금액이 모의 잔고입니다. 실전에서는 크기의 1배 기준이고(아래 sizing),
+# 실제 잔고가 늘면 포지션도 같은 배수로 커지므로 입금할 때 이 값을 고칠 필요가 없습니다.
 capital:
   arcus: 8000          # USDG  (RWA 약 2,000 + io 헤지 약 6,000)
   hl:xyz: 2000         # USDC  trade.xyz 증거금 계정 (RWA 헤지 전용)
@@ -20,9 +21,13 @@ capital:
 
 arcus:
   account_index: 0     # 봇 전용 서브계정을 권장합니다 (API 키 발급 시 Subaccount # 선택)
-  dead_mans_switch_s: 60   # 봇이 죽으면 60초 뒤 Arcus 미체결 주문 자동 취소
+  # 데드맨 스위치: 봇이 갱신을 멈추면 Arcus 서브계정의 "모든" 주문을 취소합니다. Arcus 에 걸어 둔 손절도
+  # 같이 지워지므로(테스트넷에서 확인) 기본은 끔(0). 봇은 종료·오류 때 자기 메이커 주문을 직접 취소합니다.
+  # 켜려면 5~300초. 켜면 봇이 오래 죽어 있을 때 Arcus 손절이 사라진다는 점을 감수해야 합니다.
+  dead_mans_switch_s: 0
   margin_mode: cross   # 교차증거금: 계정 전체가 각 포지션을 받쳐 줘서 청산까지 여유가 큽니다
 
+# Hyperliquid 계정은 Standard(수동) 모드여야 합니다 (통합 계정이면 봇이 시작을 거부). 확인: hedgebot hl-mode
 hyperliquid:
   dexes: [xyz, io]
   base_maker_fee: 0.00015  # 본인 HL 수수료 등급 (HIP-3 배수 적용 전)
@@ -167,6 +172,18 @@ rebalance:
   every_h: 72
   venues: [arcus, "hl:io"]
   min_transfer_usd: 200
+
+# 자금이 늘거나 줄면 포지션 크기를 자동 조정: 배수 = 실제 잔고 합계 / capital 합계
+# 예) 잔고 합계 $36k 면 모든 페어 notional_usd 가 2배. 입금은 30분 유지되면 반영,
+#     감소(출금, 거래소 간 이체 중)는 6시간 이어져야 반영되므로 리밸런싱 이체로는 포지션이 줄지 않습니다.
+sizing:
+  scale_with_equity: true
+  check_min: 5
+  min_change_pct: 10       # 배수가 10% 이상 달라질 때만 조정
+  grow_after_min: 30
+  shrink_after_h: 6
+  min_scale: 0.25
+  max_scale: 10
 
 points:
   arcus_points_per_musd: 33   # 커뮤니티 공개치 기준 추정 (RWA 위주 $100만당 약 30~40포인트)

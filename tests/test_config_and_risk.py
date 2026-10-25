@@ -122,8 +122,9 @@ def test_daily_loss_halts_new_risk():
     eng = FakeEngine({"arcus": acct("arcus", 10000, 0, {}), "hl:xyz": acct("hl:xyz", 5000, 0, {})})
     rm = RiskManager(cfg, eng)
     rm.evaluate()
-    eng.accounts["arcus"] = acct("arcus", 9600, 0, {})  # -2.7% of 15k
-    rm.evaluate()
+    for equity in (9850, 9700, 9600):  # losses accrue gradually: -2.7% of 15k
+        eng.accounts["arcus"] = acct("arcus", equity, 0, {})
+        rm.evaluate()
     assert eng.halted and eng.halt_reason == "daily loss"
 
 
@@ -135,3 +136,36 @@ def test_foreign_positions_are_reported_once():
     rm.evaluate()
     rm.evaluate()
     assert [k for _, k in eng.events].count("foreign_position") == 1
+
+
+def test_money_moving_between_venues_is_not_a_daily_loss():
+    cfg = make_config()
+    eng = FakeEngine({"arcus": acct("arcus", 10000, 0, {}), "hl:xyz": acct("hl:xyz", 5000, 0, {})})
+    rm = RiskManager(cfg, eng)
+    rm.evaluate()
+    eng.accounts["arcus"] = acct("arcus", 8000, 0, {})  # $2k sent from Arcus, not arrived yet
+    rm.evaluate()
+    assert not eng.halted
+    eng.accounts["hl:xyz"] = acct("hl:xyz", 7000, 0, {})  # it landed
+    rm.evaluate()
+    for equity in (6900, 6800, 6700):  # then a real, gradual loss of $300 (2% of 15k)
+        eng.accounts["hl:xyz"] = acct("hl:xyz", equity, 0, {})
+        rm.evaluate()
+    assert eng.halted
+
+
+def test_unreadable_venue_does_not_stop_checks_on_the_others():
+    cfg = make_config()
+    pos = {"xyz:TST": Position("xyz:TST", Dd(-10), Dd(100), Dd(100), liquidation_price=Dd(103), margin_mode="isolated")}
+    eng = FakeEngine({"arcus": acct("arcus", 9000, 0, {}), "hl:xyz": acct("hl:xyz", 5000, 0, pos)})
+
+    def down(venue, max_age_s=5):
+        if venue == "arcus":
+            from hedgebot.venues.base import VenueError
+            raise VenueError("arcus 503", retryable=True)
+        return eng.accounts[venue]
+
+    eng.account = down
+    RiskManager(cfg, eng).evaluate()
+    assert eng.venues["hl:xyz"].added  # the isolated top-up still ran
+    assert not eng.halted

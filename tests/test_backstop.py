@@ -39,13 +39,14 @@ class Engine(FakeContext):
 def test_manager_places_refreshes_and_reports_a_fired_stop(setup_pair):
     cfg, ctx, venues, arcus, hl = setup_pair()
     from hedgebot.executor import PairExecutor
-    venues["arcus"].place_order("TST-USD", Side.BUY, Dd(30), Dd("100.02"), Tif.IOC)
-    venues["hl:xyz"].place_order("xyz:TST", Side.SELL, Dd(30), Dd("99.98"), Tif.IOC)
+    venues["arcus"].place_order("TST-USD", Side.BUY, Dd(100), Dd("100.05"), Tif.IOC)
+    venues["hl:xyz"].place_order("xyz:TST", Side.SELL, Dd(100), Dd("99.95"), Tif.IOC)
     eng = Engine(cfg, venues, [])
     eng.executors = [PairExecutor(cfg.pairs[0], eng)]
     mgr = BackstopManager(eng)
     mgr.refresh()
-    # the $3k Arcus long on $10k equity cannot be liquidated (needs a >100% drop): no stop needed there
+    # the $10k Arcus long on $10k equity survives a >50% drop: no stop there; the $10k hedge short on
+    # $5k equity fails after ~44% and gets one
     assert set(mgr.active) == {("hl:xyz", "xyz:TST")}
     hedge_stop = mgr.active[("hl:xyz", "xyz:TST")]
     assert hedge_stop.order.side is Side.BUY and hedge_stop.trigger > 100
@@ -54,3 +55,10 @@ def test_manager_places_refreshes_and_reports_a_fired_stop(setup_pair):
     mgr.refresh()
     assert venues["hl:xyz"].account().position_size("xyz:TST") == 0
     assert "stop_fired" in eng.kinds()
+
+
+def test_no_stop_for_a_leg_the_account_carries_through_a_halving():
+    pos = Position("X", Dd(10), Dd(100), Dd(100))  # $1k long on a $2k cross account
+    assert stop_trigger(acct(2000, 20, {"X": pos}), pos, Dd("1.25"), Dd(2)) is None
+    short = Position("X", Dd(-10), Dd(100), Dd(100))
+    assert stop_trigger(acct(2000, 20, {"X": short}), short, Dd("1.25"), Dd(2)) is None

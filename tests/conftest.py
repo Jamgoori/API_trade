@@ -103,6 +103,7 @@ class FakeContext:
         self.saved: dict[str, dict] = {}
         self.budget_ok = True
         self.funding: dict[tuple[str, str], Decimal] = {}
+        self.scale: tuple[Decimal, int] = (Decimal(1), 0)
 
     def account(self, venue, max_age_s=5.0) -> AccountState:
         return self.venues[venue].account()
@@ -113,6 +114,9 @@ class FakeContext:
     def take_forced_reduction(self, pair):
         return self.forced.pop(pair, None)
 
+    def has_forced_reduction(self, pair):
+        return pair in self.forced
+
     def rotation_budget_left(self):
         return self.budget_ok
 
@@ -121,6 +125,9 @@ class FakeContext:
 
     def maker_venue_bias(self, pair, venue):
         return ZERO
+
+    def size_scale(self):
+        return self.scale
 
     def journal_fill(self, **kw):
         self.fills.append(kw)

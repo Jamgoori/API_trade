@@ -108,12 +108,16 @@ def build_report(journal: Journal, cfg: Config, start: float | None = None, end:
 
     # checklist for the paper test
     lines += ["", "  3-day test checklist"]
+    # passive_first waits up to passive_hedge_timeout_s for a maker hedge before crossing the spread
+    ex = cfg.execution
+    limit_s = 5 + (ex.passive_hedge_timeout_s + 10 if ex.hedge_mode == "passive_first" else 0)
     checks = [
         ("no hedge failures", kinds.get("hedge_failed", 0) == 0),
         ("imbalance repairs rare (<= 1 per day)", kinds.get("imbalance", 0) <= max(1, hours / 24)),
         ("no liquidation / de-risk", kinds.get("derisk", 0) == 0 and kinds.get("liq_distance", 0) == 0),
         ("no halts", kinds.get("halt", 0) == 0),
-        ("hedge latency p95 < 5s", not latencies or latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))] < 5000),
+        (f"hedge latency p95 < {limit_s:g}s",
+         not latencies or latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))] < limit_s * 1000),
         ("bot stayed up (>= 95% coverage)", bool(per_venue) and max(per_venue.values()) >= 0.95 * hours * 3600 / cfg.poll.snapshot_s),
     ]
     for label, ok in checks:

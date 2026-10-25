@@ -160,6 +160,14 @@ class ArcusVenue(Venue):
         resp = self.http.request(
             "POST", path, weight=0, retries=0, params={"address": signer.address}, data=body_text, headers=headers
         )
+        if resp.status_code == 401:
+            # Clock drift (X-Timestamp outside +-30s) or an expired / revoked API key.
+            try:
+                self.sync_clock()
+            except VenueError:
+                pass
+            raise VenueError(f"{context}: HTTP 401 {resp.text[:200]} (API key expired or revoked, or clock off)",
+                             status=401, retryable=True)
         return self.http.json_or_raise(resp, context)
 
     def _legacy_post(self, path: str, action: str, body: dict, weight: float = 0):
@@ -341,8 +349,8 @@ class ArcusVenue(Venue):
         client_id = client_id or new_client_id()
         p = exact_units(price, D(info.extra["tickSize"]))
         q = exact_units(size, info.step_size)
-        good_til_us = (time.time_ns() // 1000) + GOOD_TIL_DAYS * 86_400 * 1_000_000
         ts = self._ts_ns()
+        good_til_us = ts // 1000 + GOOD_TIL_DAYS * 86_400 * 1_000_000
         payload = signer.order_payload(
             op=OP_PLACE, market_id=int(info.extra["marketId"]), ct=ts, g_ns=good_til_us * 1000,
             p=p, q=q, reduce_only=reduce_only, side=side, tif=tif, client_id=client_id,
@@ -366,9 +374,11 @@ class ArcusVenue(Venue):
                                      f"placeOrder {symbol}")
         except VenueError as exc:
             # A 4xx here is a definitive rejection (tick, oracle deviation, size...).
-            if exc.status and 400 <= exc.status < 500 and exc.status != 429:
+            if exc.status and 400 <= exc.status < 500 and exc.status not in (401, 429):
                 return OrderState("", symbol, side, price, size, tif, OrderStatus.REJECTED, client_id=client_id,
                                   reduce_only=reduce_only, reject_reason=str(exc.payload), created_ts=time.time())
+            if exc.status not in (401, 429, 502):  # 502 = not submitted; otherwise it may be live
+                self._cancel_quietly(symbol, client_id)
             raise
         state = OrderState(
             order_id=str(resp.get("orderId", "")),
@@ -391,11 +401,13 @@ class ArcusVenue(Venue):
         if resp.status_code == 404:
             # Placement is asynchronous; give the store a moment before calling it lost.
             if time.time() - order.created_ts > 20:
+                if order.client_id:  # make sure a lagging order store is not hiding a live order
+                    self._cancel_quietly(order.symbol, order.client_id)
                 order.status = OrderStatus.REJECTED
                 order.reject_reason = order.reject_reason or "order not found"
             return order
         body = self.http.json_or_raise(resp, f"GET /v1/order/{order.order_id}")
-        raw = str(body.get("state") or body.get("status") or "")
+        raw = str(body.get("status") or body.get("state") or "")
         order.status = _STATUS_MAP.get(raw, order.status)
         if body.get("filledSize") is not None:
             order.filled = D(body["filledSize"])
@@ -408,27 +420,37 @@ class ArcusVenue(Venue):
         return order
 
     def cancel_order(self, symbol: str, order_id: str) -> None:
+        self._cancel(symbol, order_id=order_id)
+
+    def _cancel(self, symbol: str, *, order_id: str | None = None, client_id: str | None = None) -> None:
         signer = self._require_signer()
         market_id = self.market_id(symbol)
         ts = self._ts_ns()
-        payload = signer.cancel_payload(market_id=market_id, ct=ts, order_id=order_id)
+        payload = signer.cancel_payload(market_id=market_id, ct=ts, order_id=order_id, client_id=client_id)
         body = {
             "address": signer.address,
             "accountIndex": signer.account_index,
             "marketId": market_id,
-            "kind": "orderId",
-            "orderId": order_id,
             "timestamp": ts,
         }
+        body.update({"kind": "orderId", "orderId": order_id} if order_id else {"kind": "clientId", "clientId": client_id})
         try:
             self._signed_post("/v1/cancelOrder", canonical_json(body), ts, signer.sign(payload.encode()),
                               f"cancelOrder {symbol}")
         except VenueError as exc:
             # Already filled / already canceled is not an error for our purposes.
             if exc.status in (400, 404):
-                log.info("arcus cancel %s: %s", order_id, exc)
+                log.info("arcus cancel %s: %s", order_id or client_id, exc)
                 return
             raise
+
+    def _cancel_quietly(self, symbol: str, client_id: str) -> None:
+        """Best effort: cancel by clientId an order whose placement outcome is unknown."""
+        try:
+            self._cancel(symbol, client_id=client_id)
+            log.warning("arcus: placement of %s %s was ambiguous; sent cancel by clientId", symbol, client_id)
+        except VenueError as exc:
+            log.warning("arcus: cancel by clientId %s failed: %s", client_id, exc)
 
     def cancel_all(self) -> None:
         signer = self._require_signer()
@@ -456,8 +478,8 @@ class ArcusVenue(Venue):
         bound = trigger * (1 - STOP_SLIPPAGE_BOUND) if side is Side.SELL else trigger * (1 + STOP_SLIPPAGE_BOUND)
         price = self.round_price(symbol, bound, "down" if side is Side.SELL else "up")
         client_id = new_client_id("bs")
-        good_til_us = (time.time_ns() // 1000) + GOOD_TIL_DAYS * 86_400 * 1_000_000
         ts = self._ts_ns()
+        good_til_us = ts // 1000 + GOOD_TIL_DAYS * 86_400 * 1_000_000
         payload = signer.order_payload(
             op=OP_PLACE_UNTRIGGERED, market_id=int(info.extra["marketId"]), ct=ts, g_ns=good_til_us * 1000,
             p=exact_units(price, D(info.extra["tickSize"])), q=0, reduce_only=True, side=side, tif=Tif.IOC,
@@ -489,7 +511,7 @@ class ArcusVenue(Venue):
                                                                               "orders": [element]}),
                                      ts, signature, f"positionTpsl {symbol}")
         except VenueError as exc:
-            if exc.status and 400 <= exc.status < 500 and exc.status != 429:
+            if exc.status and 400 <= exc.status < 500 and exc.status not in (401, 429):
                 state.status, state.reject_reason = OrderStatus.REJECTED, str(exc.payload)
                 return state
             raise
@@ -499,13 +521,15 @@ class ArcusVenue(Venue):
             state.status = OrderStatus.REJECTED
             state.reject_reason = str(row.get("error") or row.get("rejectionReason"))
         else:
-            state.status = OrderStatus.OPEN
+            # 202 rows say ACK: the engine can still reject it (e.g. POSITION_TPSL_ALREADY_EXISTS);
+            # the backstop manager polls it with order_state.
+            state.status = _STATUS_MAP.get(str(row.get("status")), OrderStatus.PENDING)
         return state
 
     def heartbeat(self, lead_s: int = 60) -> None:
         """Arm/refresh the dead man's switch so resting maker orders die with the bot."""
         signer = self._require_signer()
-        deadline = (time.time_ns() // 1000) + int(lead_s * 1_000_000)
+        deadline = self._ts_ns() // 1000 + int(lead_s * 1_000_000)
         self._legacy_post("/v1/scheduleCancel", "scheduleCancel",
                           {"address": signer.address, "accountIndex": signer.account_index, "time": deadline})
         self._dms_deadline_us = deadline

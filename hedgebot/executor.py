@@ -36,6 +36,8 @@ SETTLE_S = 2.5  # let venue position stores catch up after a clip before judging
 CANCEL_RETRY_S = 20
 REJECT_COOLDOWN_S = 30
 HEDGE_FAILURE_COOLDOWN_S = 600
+MAX_UNEXPECTED_ERRORS = 20  # consecutive non-venue exceptions before a pair is switched off
+HEDGE_ERROR_GIVEUP_S = 20  # hedge venue erroring this long: undo the unhedged fill on the maker venue
 BASIS_HALF_LIFE_S = 1800
 
 
@@ -55,9 +57,11 @@ class Context(Protocol):
     def account(self, venue: str, max_age_s: float = ...) -> AccountState: ...
     def invalidate_account(self, venue: str) -> None: ...
     def take_forced_reduction(self, pair: str) -> Decimal | None: ...
+    def has_forced_reduction(self, pair: str) -> bool: ...
     def rotation_budget_left(self) -> bool: ...
     def funding_avg(self, venue: str, symbol: str) -> Decimal: ...
     def maker_venue_bias(self, pair: str, venue: str) -> Decimal: ...
+    def size_scale(self) -> tuple[Decimal, int]: ...
     def journal_fill(self, **kwargs) -> None: ...
     def journal_order(self, venue: str, pair: str, purpose: str, order: OrderState) -> None: ...
     def event(self, level: str, kind: str, message: str, *, pair: str | None = None, venue: str | None = None,
@@ -77,6 +81,7 @@ class Runtime:
     rotations_done: int = 0
     flip_pending: bool = False
     derisk_until: float = 0.0
+    scale_seen: int = 0  # engine sizing version the target was computed with
 
     @property
     def target(self) -> Decimal:
@@ -106,6 +111,7 @@ class Clip:
     hedge_cancel_requested: bool = False
     hedge_cancel_ts: float = 0.0
     hedge_escalate: bool = False
+    hedge_error_since: float = 0.0  # first venue error while hedging (0 = none)
 
 
 @dataclass
@@ -186,9 +192,10 @@ class PairExecutor:
         try:
             if self.clip:
                 self._manage_clip(now)
-            elif now >= self.settle_until and now >= self.cooldown_until:
+            elif now >= self.settle_until:
                 self._decide(now)
             self.stats.consecutive_errors = 0
+            self.stats.extra.pop("unexpected", None)
         except VenueError as exc:
             self.stats.errors += 1
             self.stats.consecutive_errors += 1
@@ -196,6 +203,19 @@ class PairExecutor:
             level = "error" if self.stats.consecutive_errors >= self.cfg.risk.max_consecutive_errors else "warning"
             self.ctx.event(level, "venue_error", f"{self.name}: {exc}", pair=self.name, notify=level == "error",
                            throttle_key=f"err:{self.name}", throttle_s=900)
+        except Exception as exc:  # a bug or an unexpected response must not take the other pairs down
+            log.exception("%s: unexpected error", self.name)
+            self.stats.errors += 1
+            self.stats.last_error = repr(exc)
+            count = self.stats.extra["unexpected"] = self.stats.extra.get("unexpected", 0) + 1
+            if count >= MAX_UNEXPECTED_ERRORS:
+                self.disabled_reason = f"{count} unexpected errors in a row: {exc!r}"
+                self.ctx.event("critical", "pair_disabled", f"{self.name}: stopped trading this pair ({self.disabled_reason}). "
+                               "Positions and exchange stops stay; restart after checking the log.",
+                               pair=self.name, notify=True)
+            else:
+                self.ctx.event("error", "bug", f"{self.name}: unexpected error {exc!r}", pair=self.name, notify=True,
+                               throttle_key=f"bug:{self.name}", throttle_s=900)
 
     def _snapshot(self, max_age_s: float) -> Snapshot:
         maker_mkt = self.maker.market(self.pair.maker.symbol)
@@ -223,6 +243,8 @@ class PairExecutor:
         if forced is not None and snap.maker_pos != 0:
             self._start_derisk(snap, forced, now)
             return
+        if now < self.cooldown_until:
+            return  # no new clips yet (after a reject / failed hedge); repairs above still run
         desired = self._desired_position(snap, now)
         if desired is not None:
             self._maybe_start_clip(snap, desired, now)
@@ -246,12 +268,22 @@ class PairExecutor:
             self.persist()
 
     def _retarget(self, snap: Snapshot) -> None:
+        scale, version = self.ctx.size_scale()
         self.rt.target_qty = str(strategy.target_quantity(
-            self.rt.direction, self.pair.notional_usd, snap.maker_bbo.mid, snap.maker_mkt.step_size))
+            self.rt.direction, self.pair.notional_usd * scale, snap.maker_bbo.mid, snap.maker_mkt.step_size))
+        self.rt.scale_seen = version
 
     def _desired_position(self, snap: Snapshot, now: float) -> Decimal | None:
         s = self.cfg.strategy
         self._ensure_direction(snap, now)
+        scale, version = self.ctx.size_scale()
+        if self.rt.direction and version != self.rt.scale_seen and Phase(self.rt.phase) is not Phase.UNWIND:
+            old = self.rt.target
+            self._retarget(snap)  # an UNWIND retargets when it completes
+            self.rt.phase = Phase.BUILD.value
+            self.ctx.event("info", "resize", f"{self.name}: size x{scale} -> target {old} -> {self.rt.target}",
+                           pair=self.name)
+            self.persist()
         pos, target = snap.maker_pos, self.rt.target
         tol = s.target_tolerance
         phase = Phase(self.rt.phase)
@@ -459,24 +491,11 @@ class PairExecutor:
 
         hedge_mkt = self.hedge.market(self.pair.hedge.symbol)
         hedge_px = hedge_mkt.mark_price if hedge_mkt.mark_price > 0 else clip.maker_mid
-        if clip.hedge_order is not None:
-            self._work_passive_hedge(clip, now)
-        elif clip.hedge_pending > 0 and not clip.hedge_failed:
-            hedge_qty = self.hedge.round_size(self.pair.hedge.symbol, clip.hedge_pending)
-            if hedge_qty > 0 and hedge_qty * hedge_px >= hedge_mkt.min_notional:
-                passive = self.cfg.execution.hedge_mode == "passive_first" and not clip.urgent
-                if passive and not clip.hedge_escalate:
-                    if not order.status.done and not clip.cancel_requested:
-                        # stop adding one-legged exposure while the hedge rests on the book
-                        self.maker.cancel_order(self.pair.maker.symbol, order.order_id)
-                        clip.cancel_requested, clip.cancel_ts = True, now
-                    self._start_passive_hedge(clip, hedge_qty, now)
-                else:
-                    self._hedge(clip, hedge_qty, now)
-            elif order.status.done:
-                # Below the hedge venue's minimum order size; the imbalance check repairs it if it ever matters.
-                self.ctx.event("info", "hedge_residual", f"{self.name}: {clip.hedge_pending} left unhedged (below min size)",
-                               pair=self.name)
+        try:
+            self._work_hedge(clip, order, hedge_mkt, hedge_px, now)
+            clip.hedge_error_since = 0.0
+        except VenueError as exc:
+            self._on_hedge_error(clip, order, exc, now)
 
         hedge_busy = clip.hedge_order is not None or (
             not clip.hedge_failed and clip.hedge_pending > 0
@@ -505,6 +524,46 @@ class PairExecutor:
             clip.cancel_requested = True
             clip.cancel_ts = now
 
+    def _work_hedge(self, clip: Clip, order: OrderState, hedge_mkt: MarketInfo, hedge_px: Decimal, now: float) -> None:
+        if clip.hedge_order is not None:
+            self._work_passive_hedge(clip, now)
+        elif clip.hedge_pending > 0 and not clip.hedge_failed:
+            hedge_qty = self.hedge.round_size(self.pair.hedge.symbol, clip.hedge_pending)
+            if hedge_qty > 0 and hedge_qty * hedge_px >= hedge_mkt.min_notional:
+                passive = self.cfg.execution.hedge_mode == "passive_first" and not clip.urgent
+                if passive and not clip.hedge_escalate:
+                    if not order.status.done and not clip.cancel_requested:
+                        # stop adding one-legged exposure while the hedge rests on the book
+                        self.maker.cancel_order(self.pair.maker.symbol, order.order_id)
+                        clip.cancel_requested, clip.cancel_ts = True, now
+                    self._start_passive_hedge(clip, hedge_qty, now)
+                else:
+                    self._hedge(clip, hedge_qty, now)
+            elif order.status.done:
+                # Below the hedge venue's minimum order size; the imbalance check repairs it if it ever matters.
+                self.ctx.event("info", "hedge_residual", f"{self.name}: {clip.hedge_pending} left unhedged (below min size)",
+                               pair=self.name)
+
+    def _on_hedge_error(self, clip: Clip, order: OrderState, exc: VenueError, now: float) -> None:
+        """Hedge venue erroring: stop the maker order adding size; after HEDGE_ERROR_GIVEUP_S undo the fill."""
+        clip.hedge_error_since = clip.hedge_error_since or now
+        if not order.status.done and not clip.cancel_requested:
+            try:
+                self.maker.cancel_order(self.pair.maker.symbol, order.order_id)
+                clip.cancel_requested, clip.cancel_ts = True, now
+            except VenueError:
+                pass
+        if now - clip.hedge_error_since < HEDGE_ERROR_GIVEUP_S or clip.hedge_pending <= 0 or clip.hedge_failed:
+            raise exc  # logged by step(); retried next tick
+        if clip.hedge_order is not None:  # a passive hedge may still rest there: try to pull it first
+            try:
+                self.hedge.cancel_order(self.pair.hedge.symbol, clip.hedge_order.order_id)
+            except VenueError:
+                pass
+            clip.hedge_order = None
+        self._give_up_hedge(clip, clip.hedge_pending, now, f"{self.hedge.name} erroring for "
+                            f"{now - clip.hedge_error_since:.0f}s ({exc})")
+
     def _should_cancel(self, clip: Clip, order: OrderState, now: float) -> str | None:
         s = self.cfg.strategy
         age = now - (order.created_ts or now)
@@ -514,6 +573,10 @@ class PairExecutor:
             return "hedge failed"
         if order.tif is not Tif.ALO:
             return None
+        if clip.purpose != "derisk" and self.ctx.has_forced_reduction(self.name):
+            return "derisk"
+        if clip.hedge_order is None and self._legs_off(clip):
+            return "legs off"  # a leg was stopped / liquidated meanwhile; the imbalance check takes over
         bbo = self.maker.bbo(self.pair.maker.symbol)
         behind = bbo.bid > order.price if clip.maker_side is Side.BUY else bbo.ask < order.price
         if behind and age >= s.reprice_after_s:
@@ -529,6 +592,14 @@ class PairExecutor:
         if hedge_bbo.spread_bps > s.max_hedge_spread_bps * 2:
             return "hedge spread"
         return None
+
+    def _legs_off(self, clip: Clip) -> bool:
+        """Net exposure beyond what this clip has filled and not hedged yet."""
+        acct_age = self.cfg.poll.account_s
+        maker_pos = self.ctx.account(self.pair.maker.venue, acct_age).position_size(self.pair.maker.symbol)
+        hedge_pos = self.ctx.account(self.pair.hedge.venue, acct_age).position_size(self.pair.hedge.symbol)
+        unexplained = abs(maker_pos + hedge_pos / self.ratio) - clip.hedge_pending / self.ratio
+        return unexplained * clip.maker_mid > self.cfg.execution.imbalance_tolerance_usd
 
     # ---------------------------------------------------------- passive hedge
     def _start_passive_hedge(self, clip: Clip, qty: Decimal, now: float) -> None:
@@ -553,6 +624,10 @@ class PairExecutor:
         order = venue.order_state(clip.hedge_order)
         new_fill = order.filled - clip.hedge_filled_seen
         if new_fill > 0:
+            clip.hedge_pending -= new_fill  # state first: a journal error must not hedge this fill twice
+            clip.hedge_filled_seen = order.filled
+            self.stats.hedges += 1
+            self.ctx.invalidate_account(self.pair.hedge.venue)
             mkt = venue.market(symbol)
             self.ctx.journal_fill(
                 venue=venue.name, symbol=symbol, pair=self.name, purpose="hedge", order_id=order.order_id,
@@ -560,10 +635,6 @@ class PairExecutor:
                 liquidity="maker", mid=clip.hedge_ref_mid, outside_rth=clip.outside_rth,
                 hedge_latency_ms=int((time.time() - clip.last_fill_ts) * 1000) if clip.last_fill_ts else None,
             )
-            clip.hedge_pending -= new_fill
-            clip.hedge_filled_seen = order.filled
-            self.stats.hedges += 1
-            self.ctx.invalidate_account(self.pair.hedge.venue)
         if order.status.done:
             clip.hedge_order = None
             clip.hedge_cancel_requested = False
@@ -611,6 +682,11 @@ class PairExecutor:
             price = venue.round_price(symbol, raw, "up" if side is Side.BUY else "down")
             order = venue.place_order(symbol, side, remaining, price, Tif.IOC, reduce_only=reduce_only)
             order = self._wait_done(venue, order)
+            if order.filled > 0:
+                remaining -= order.filled  # state first: a journal error must not hedge this fill twice
+                clip.hedge_pending -= order.filled
+                self.stats.hedges += 1
+                self.ctx.invalidate_account(self.pair.hedge.venue)
             self.ctx.journal_order(venue.name, self.name, "hedge", order)
             if order.filled > 0:
                 fill_px = order.avg_price or price
@@ -621,29 +697,42 @@ class PairExecutor:
                     liquidity="taker", mid=bbo.mid, outside_rth=clip.outside_rth,
                     hedge_latency_ms=int((time.time() - clip.last_fill_ts) * 1000) if clip.last_fill_ts else None,
                 )
-                remaining -= order.filled
-                clip.hedge_pending -= order.filled
-                self.stats.hedges += 1
-                self.ctx.invalidate_account(self.pair.hedge.venue)
             elif order.status is OrderStatus.REJECTED and reduce_only and "reduce" in (order.reject_reason or "").lower():
                 reduce_only = False  # our cached hedge position was stale; retry as a plain order
             if remaining * ref < mkt.min_notional:
                 return
-        # Ladder exhausted with a meaningful unhedged quantity: close it on the maker leg.
         unhedged_maker = remaining / self.ratio
-        if unhedged_maker * clip.maker_mid > self.cfg.execution.imbalance_tolerance_usd:
-            clip.hedge_failed = True
-            self.stats.hedge_failures += 1
-            self.ctx.event("critical", "hedge_failed",
-                           f"{self.name}: could not hedge {remaining} on {venue.name}; closing maker leg instead",
-                           pair=self.name, venue=venue.name, notify=True)
-            self.flatten_leg(self.maker, self.pair.maker.symbol, clip.maker_side.opposite(), unhedged_maker,
-                              "hedge_fail_unwind", clip.outside_rth)
+        if unhedged_maker * clip.maker_mid <= self.cfg.execution.imbalance_tolerance_usd:
+            # Small leftover: stop re-running the ladder every tick; the imbalance check owns it now.
             clip.hedge_pending = ZERO
-            self.cooldown_until = now + HEDGE_FAILURE_COOLDOWN_S
+            self.ctx.event("info", "hedge_residual", f"{self.name}: {remaining} left unhedged on {venue.name}",
+                           pair=self.name)
+            return
+        self._give_up_hedge(clip, remaining, now, f"no fill within {ladder[-1]}bps")
 
-    def flatten_leg(self, venue: Venue, symbol: str, side: Side, qty: Decimal, purpose: str, outside_rth: bool) -> Decimal:
-        """Reduce-only IOC on one leg (imbalance repair / failed hedge). Returns filled qty."""
+    def _give_up_hedge(self, clip: Clip, remaining: Decimal, now: float, why: str) -> None:
+        """Undo an unhedgeable fill on the maker leg (or, for a de-risk, leave it to the imbalance repair)."""
+        venue = self.hedge
+        clip.hedge_failed = True
+        clip.hedge_pending = ZERO
+        self.stats.hedge_failures += 1
+        self.cooldown_until = now + HEDGE_FAILURE_COOLDOWN_S
+        if clip.purpose == "derisk":
+            # Re-opening the maker leg would undo a risk cut; the imbalance repair shrinks the hedge leg instead.
+            self.ctx.event("critical", "hedge_failed", f"{self.name}: could not reduce the hedge by {remaining} on "
+                           f"{venue.name} ({why}); retrying through the imbalance repair", pair=self.name,
+                           venue=venue.name, notify=True)
+            return
+        self.ctx.event("critical", "hedge_failed",
+                       f"{self.name}: could not hedge {remaining} on {venue.name} ({why}); undoing it on the maker leg",
+                       pair=self.name, venue=venue.name, notify=True)
+        # A build clip added to the maker leg (undo = reduce); an unwind clip reduced it (undo = add back).
+        self.flatten_leg(self.maker, self.pair.maker.symbol, clip.maker_side.opposite(), remaining / self.ratio,
+                         "hedge_fail_unwind", clip.outside_rth, reduce_only=not clip.order.reduce_only)
+
+    def flatten_leg(self, venue: Venue, symbol: str, side: Side, qty: Decimal, purpose: str, outside_rth: bool,
+                    reduce_only: bool = True) -> Decimal:
+        """IOC on one leg (imbalance repair / failed hedge), reduce-only unless told otherwise. Returns filled qty."""
         qty = venue.round_size(symbol, qty)
         if qty <= 0:
             return ZERO
@@ -653,7 +742,7 @@ class PairExecutor:
         ref = bbo.price_for(side, aggressive=True)
         price = venue.round_price(symbol, ref * (1 + slip) if side is Side.BUY else ref * (1 - slip),
                                   "up" if side is Side.BUY else "down")
-        order = venue.place_order(symbol, side, qty, price, Tif.IOC, reduce_only=True)
+        order = venue.place_order(symbol, side, qty, price, Tif.IOC, reduce_only=reduce_only)
         order = self._wait_done(venue, order)
         self.ctx.journal_order(venue.name, self.name, purpose, order)
         if order.filled > 0:
@@ -730,24 +819,26 @@ class PairExecutor:
         """Cancel the resting maker order and hedge whatever filled before the cancel landed."""
         if not self.clip:
             return
-        try:
-            clip = self.clip
-            if not clip.order.status.done:
-                self.maker.cancel_order(self.pair.maker.symbol, clip.order.order_id)
-            clip.cancel_requested = True
-            clip.cancel_ts = time.time()
-            clip.hedge_escalate = True  # no time to wait for a passive hedge: cross the spread
-            if clip.hedge_order is not None and not clip.hedge_cancel_requested:
-                self.hedge.cancel_order(self.pair.hedge.symbol, clip.hedge_order.order_id)
-                clip.hedge_cancel_requested, clip.hedge_cancel_ts = True, time.time()
-            deadline = time.time() + timeout_s
-            while self.clip and time.time() < deadline:
+        clip = self.clip
+        clip.hedge_escalate = True  # no time to wait for a passive hedge: cross the spread
+        deadline = time.time() + timeout_s
+        error = None
+        while self.clip and time.time() < deadline:
+            try:  # every pass retries whatever cancel has not landed yet
+                if not clip.order.status.done and not clip.cancel_requested:
+                    self.maker.cancel_order(self.pair.maker.symbol, clip.order.order_id)
+                    clip.cancel_requested, clip.cancel_ts = True, time.time()
+                if clip.hedge_order is not None and not clip.hedge_cancel_requested:
+                    self.hedge.cancel_order(self.pair.hedge.symbol, clip.hedge_order.order_id)
+                    clip.hedge_cancel_requested, clip.hedge_cancel_ts = True, time.time()
                 self._manage_clip(time.time())
-                if self.clip:
-                    time.sleep(0.5)
-        except VenueError as exc:
-            self.ctx.event("error", "shutdown", f"{self.name}: shutdown cancel failed: {exc}", pair=self.name,
-                           notify=True)
+            except VenueError as exc:
+                error = exc
+            if self.clip:
+                time.sleep(0.5)
+        if self.clip:
+            self.ctx.event("error", "shutdown", f"{self.name}: order may still rest after shutdown"
+                           f"{f' ({error})' if error else ''}", pair=self.name, notify=True)
 
     def status(self) -> dict:
         return {

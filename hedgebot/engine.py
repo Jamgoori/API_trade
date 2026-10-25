@@ -18,13 +18,27 @@ from .models import AccountState, OrderState, Side
 from .notifier import Notifier
 from .rebalance import describe, plan_transfers, weights_from
 from .risk import RiskManager
+from .sizing import SizeScaler
 from .util import ZERO, D
 from .venues.arcus import ArcusSigner, ArcusVenue
 from .venues.base import Venue, VenueError
-from .venues.hyperliquid import HyperliquidClient, HyperliquidVenue
+from .venues.hyperliquid import STANDARD_MODES, HyperliquidClient, HyperliquidVenue
 from .venues.paper import PaperVenue
 
 log = logging.getLogger(__name__)
+
+HL_MODE_HELP = ("Hyperliquid account {address} is in '{mode}' mode. The bot needs Standard mode "
+                "(separate trade.xyz / Entropy balances): switch it in the Hyperliquid app or run "
+                "`hedgebot hl-mode --set-standard --i-understand-live`, then move USDC into the xyz and io dexes.")
+
+
+def check_hl_mode(venues: dict[str, Venue]) -> None:
+    """Refuse to trade when the HL account pools balances across dexes (per-dex states are meaningless then)."""
+    clients = {id(v.client): v.client for v in venues.values() if isinstance(v, HyperliquidVenue) and v.can_trade}
+    for client in clients.values():
+        mode = client.account_mode()
+        if mode not in STANDARD_MODES:
+            raise SystemExit(HL_MODE_HELP.format(address=client.account_address, mode=mode))
 
 
 def build_market_venues(cfg: Config, secrets: Secrets | None, *, trading: bool) -> dict[str, Venue]:
@@ -68,6 +82,8 @@ class Engine:
         self._funding_cache: dict[tuple[str, str], tuple[float, Decimal]] = {}
         self._timers: dict[str, float] = {}
         self.rng = random.Random(cfg.strategy.seed)
+        saved = self.journal.load_pair_state("__sizing__") or {}
+        self.scaler = SizeScaler(cfg.sizing, D(saved.get("scale", 1)), int(saved.get("version", 0)), bool(saved))
 
         trading = cfg.mode in ("testnet", "live")
         market_venues = build_market_venues(cfg, secrets, trading=trading)
@@ -104,9 +120,15 @@ class Engine:
     def take_forced_reduction(self, pair: str) -> Decimal | None:
         return self._forced.pop(pair, None)
 
+    def has_forced_reduction(self, pair: str) -> bool:
+        return pair in self._forced
+
     def rotation_budget_left(self) -> bool:
         day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-        return self.journal.cost_since(day_start) < self.cfg.strategy.max_daily_cost_usd
+        return self.journal.cost_since(day_start) < self.cfg.strategy.max_daily_cost_usd * self.scaler.scale
+
+    def size_scale(self) -> tuple[Decimal, int]:
+        return self.scaler.scale, self.scaler.version
 
     def funding_avg(self, venue: str, symbol: str) -> Decimal:
         key = (venue, symbol)
@@ -163,6 +185,45 @@ class Engine:
         self.halted, self.halt_reason = False, None
         self.event("info", "resume", f"resumed ({why})", notify=True)
 
+    # ----------------------------------------------------------------- sizing
+    def measure_scale(self) -> Decimal | None:
+        """Total live equity / total configured capital; None when it cannot be measured."""
+        venues = [v for v in self.venues if D(self.cfg.capital.get(v, 0)) > 0]
+        base = sum((D(self.cfg.capital[v]) for v in venues), ZERO)
+        if base <= 0:
+            return None
+        try:
+            return sum((self.account(v, self.cfg.poll.account_s).equity for v in venues), ZERO) / base
+        except VenueError as exc:
+            log.warning("sizing: equity read failed: %s", exc)
+            return None
+
+    def _update_scale(self, now: float | None = None) -> None:
+        z = self.cfg.sizing
+        if not z.scale_with_equity:
+            return
+        raw = self.measure_scale()
+        if raw is None:
+            return
+        first = not self.scaler.known
+        old = self.scaler.scale
+        result = self.scaler.observe(raw, now or time.time())
+        if first or (result and result[0] == "apply"):
+            self.journal.save_pair_state("__sizing__", self.scaler.state())
+        if not result:
+            return
+        kind, value = result
+        if kind == "pending":
+            wait = f"{z.grow_after_min:g} min" if value > old else f"{z.shrink_after_h:g} h"
+            self.event("info", "sizing", f"equity is x{value:.2f} of the configured capital (positions sized for "
+                       f"x{old}); resizing if it holds for {wait}", notify=True)
+        elif kind == "cleared":
+            log.info("sizing: equity back near x%s, no resize", old)
+        else:
+            total = sum((p.notional_usd for p in self.cfg.pairs if p.enabled), ZERO) * value
+            self.event("warning", "sizing", f"position size x{old} -> x{value}; total pair notional now "
+                       f"${total:,.0f}", notify=True)
+
     # ----------------------------------------------------------------- set-up
     def _due(self, key: str, every_s: float) -> bool:
         if time.time() - self._timers.get(key, 0) >= every_s:
@@ -170,11 +231,13 @@ class Engine:
             return True
         return False
 
-    def setup(self) -> None:
+    def setup(self, cancel_orders: bool = True) -> None:
         for name, venue in self.venues.items():
             venue.refresh_markets()
             if isinstance(venue, ArcusVenue):
                 venue.sync_clock()
+        if self.cfg.mode in ("testnet", "live"):
+            check_hl_mode(self.venues)
         for pair in self.cfg.pairs:
             if not pair.enabled:
                 continue
@@ -188,8 +251,9 @@ class Engine:
             self.executors.append(ex)
         if not self.executors:
             raise SystemExit("no tradeable pairs")
+        self._update_scale()
         self._configure_margin()  # paper venues simulate the same leverage / margin mode
-        if self.cfg.mode in ("testnet", "live"):
+        if self.cfg.mode in ("testnet", "live") and cancel_orders:
             for name, venue in self.venues.items():
                 try:
                     venue.cancel_all()
@@ -266,37 +330,57 @@ class Engine:
                          f"rot {st['rotations']}")
         if self.backstops:
             parts.append(f"stops {len(self.backstops.active)}")
+        parts.append(f"size x{self.scaler.scale}")
         log.info("status | %s%s", " | ".join(parts), " | HALTED" if self.halted else "")
+
+    def _guarded(self, name: str, fn) -> None:
+        """Run one housekeeping step; an error in it must not stop risk checks, stops or the other pairs."""
+        try:
+            fn()
+        except VenueError as exc:
+            self.event("warning", name, f"{name} failed: {exc}", throttle_key=f"tickerr:{name}", throttle_s=600)
+        except Exception as exc:
+            log.exception("%s failed", name)
+            self.event("error", "bug", f"{name} failed unexpectedly: {exc!r}", notify=True,
+                       throttle_key=f"tickbug:{name}", throttle_s=900)
+
+    def _refresh_markets(self) -> None:
+        for name, venue in self.venues.items():
+            try:
+                venue.refresh_markets()
+                if isinstance(venue, ArcusVenue) and self._due("clock", 600):
+                    venue.sync_clock()
+            except VenueError as exc:
+                log.warning("market refresh %s failed: %s", name, exc)
+
+    def _snapshots(self) -> None:
+        for name in self.venues:
+            try:
+                self.journal.snapshot(self.account(name, self.cfg.poll.account_s))
+            except VenueError as exc:
+                log.warning("snapshot %s failed: %s", name, exc)
+        self._log_status()
 
     def tick(self) -> None:
         cfg = self.cfg
         if self._due("markets", cfg.poll.markets_s):
-            for name, venue in self.venues.items():
-                try:
-                    venue.refresh_markets()
-                except VenueError as exc:
-                    log.warning("market refresh %s failed: %s", name, exc)
-        if self.cfg.mode != "paper" and self._due("heartbeat", max(5, cfg.arcus.dead_mans_switch_s / 4)):
-            self._heartbeat()
-        try:
-            self.risk.evaluate()
-        except VenueError as exc:
-            self.event("warning", "risk", f"risk check failed: {exc}", throttle_key="riskerr", throttle_s=600)
+            self._guarded("markets", self._refresh_markets)
+        dms = cfg.arcus.dead_mans_switch_s
+        if self.cfg.mode != "paper" and dms and self._due("heartbeat", max(2, dms / 4)):
+            self._guarded("heartbeat", self._heartbeat)
+        self._guarded("risk", self.risk.evaluate)
         for ex in self.executors:
-            ex.step()
+            ex.step()  # contains its own errors
         if self.backstops and self._due("backstop", cfg.risk.backstop_refresh_s):
-            self.backstops.refresh()
+            self._guarded("backstop", self.backstops.refresh)
         if self._due("snapshot", cfg.poll.snapshot_s):
-            for name in self.venues:
-                try:
-                    self.journal.snapshot(self.account(name, cfg.poll.account_s))
-                except VenueError as exc:
-                    log.warning("snapshot %s failed: %s", name, exc)
-            self._log_status()
+            self._guarded("snapshot", self._snapshots)
         if self._due("reconcile", 600):
-            self._reconcile_fills()
+            self._guarded("reconcile", self._reconcile_fills)
         if self.cfg.rebalance.enabled and self._due("rebalance_check", 300):
-            self._rebalance_reminder()
+            self._guarded("rebalance", self._rebalance_reminder)
+        if self._due("sizing", cfg.sizing.check_min * 60):
+            self._guarded("sizing", self._update_scale)
 
     def rebalance_plan(self) -> tuple[list, dict, dict]:
         rb = self.cfg.rebalance
@@ -317,9 +401,34 @@ class Engine:
                    notify=True)
         self.journal.save_pair_state("__rebalance__", {"last_ts": time.time()})
 
+    def _setup_with_retry(self) -> None:
+        """A venue outage at start-up is waited out (with alerts) instead of exiting into a restart loop."""
+        delay = 15.0
+        while True:
+            try:
+                self.setup()
+                return
+            except VenueError as exc:
+                self.executors.clear()
+                self.event("error", "setup", f"start-up failed ({exc}); retrying in {delay:.0f}s", notify=True,
+                           throttle_key="setup", throttle_s=1800)
+            until = time.time() + delay
+            while time.time() < until:
+                if self._stop:
+                    raise SystemExit("stopped during start-up")
+                time.sleep(1)
+            delay = min(delay * 2, 300)
+
     def run(self, max_runtime_s: float | None = None) -> None:
         self._install_signals()
-        self.setup()
+        try:
+            self._setup_with_retry()
+        except BaseException:
+            self.notifier.flush()
+            raise
+        if self.backstops:  # start-up canceled the old stops: put them back before anything else
+            self._guarded("backstop", self.backstops.refresh)
+            self._timers["backstop"] = time.time()
         started = time.time()
         try:
             while not self._stop:
@@ -334,37 +443,97 @@ class Engine:
 
     def shutdown(self) -> None:
         for ex in self.executors:
-            ex.shutdown()
+            try:
+                ex.shutdown()
+            except Exception:
+                log.exception("%s: shutdown failed", ex.name)
+        left = [ex.name for ex in self.executors if ex.clip is not None]
         for name, venue in self.venues.items():
-            if isinstance(venue, ArcusVenue) and venue.can_trade:
-                try:
+            if isinstance(venue, ArcusVenue) and venue.can_trade and self.cfg.arcus.dead_mans_switch_s and not left:
+                try:  # with an order still resting, leave the switch armed so the venue cancels it
                     venue.disarm_heartbeat()
                 except VenueError as exc:
                     log.warning("%s: disarm dead man's switch failed: %s", name, exc)
         for name in self.venues:
             try:
                 self.journal.snapshot(self.account(name, 0))
-            except VenueError:
+            except Exception:
                 pass
-        self.event("info", "stop", "stopped (positions left in place, resting orders canceled)", notify=True)
+        if left:
+            self.event("critical", "stop", f"stopped, but an order of {', '.join(left)} may still rest on the book: "
+                       "check open orders. Positions and exchange stops are left in place.", notify=True)
+        else:
+            self.event("info", "stop", "stopped (positions and exchange stops left in place, resting orders "
+                       "canceled)", notify=True)
+        self.notifier.flush()
 
 
-def flatten_all(engine: Engine) -> None:
-    """Emergency: close both legs of every pair with reduce-only IOCs."""
+def flatten_all(engine: Engine, attempts: int = 3) -> list[str]:
+    """Emergency: close both legs of every pair with reduce-only IOCs. Returns what could not be closed.
+
+    The hedge leg is only reduced to mirror what is left of the maker leg, so a maker close that
+    fills partly never leaves the maker leg naked. Whatever is left keeps an exchange stop.
+    """
     if not engine.executors:
-        engine.setup()
-    for ex in engine.executors:
-        for venue, symbol in ((ex.maker, ex.pair.maker.symbol), (ex.hedge, ex.pair.hedge.symbol)):
-            pos = engine.account(venue.name, 0).position_size(symbol)
-            if pos != 0:
-                filled = ex.flatten_leg(venue, symbol, Side.SELL if pos > 0 else Side.BUY, abs(pos), "flatten", False)
-                engine.event("warning", "flatten", f"{venue.name} {symbol}: closed {filled} of {pos}", notify=True)
-        ex.rt.direction = 0
-        ex.rt.phase = "build"
-        ex.rt.target_qty = "0"
-        ex.persist()
-    if engine.backstops:
-        engine.backstops.cancel_all()
+        engine.setup(cancel_orders=False)  # keep the exchange stops until each leg is actually closed
+    leftovers = []
+    try:
+        for ex in engine.executors:
+            leftovers += _flatten_pair(engine, ex, attempts)
+    finally:
+        if engine.backstops:
+            try:
+                engine.backstops.refresh()  # stops for whatever is left; flat legs get none
+            except Exception:
+                log.exception("stop refresh after flatten failed")
+        if leftovers:
+            engine.event("critical", "flatten", "still open after flatten: " + "; ".join(leftovers), notify=True)
+        engine.notifier.flush()
+    return leftovers
+
+
+def _flatten_pair(engine: Engine, ex, attempts: int) -> list[str]:
+    maker_sym, hedge_sym = ex.pair.maker.symbol, ex.pair.hedge.symbol
+    try:
+        for _ in range(attempts):
+            m = engine.account(ex.maker.name, 0).position_size(maker_sym)
+            if m != 0:
+                filled = ex.flatten_leg(ex.maker, maker_sym, Side.SELL if m > 0 else Side.BUY, abs(m), "flatten", False)
+                engine.event("warning", "flatten", f"{ex.maker.name} {maker_sym}: closed {filled} of {m}", notify=True)
+                m = engine.account(ex.maker.name, 0).position_size(maker_sym)
+            h = engine.account(ex.hedge.name, 0).position_size(hedge_sym)
+            excess = h + m * ex.ratio  # hedge beyond what still mirrors the maker leg
+            if ex.hedge.round_size(hedge_sym, abs(excess)) > 0 and (h > 0) == (excess > 0):
+                qty = min(abs(excess), abs(h))
+                filled = ex.flatten_leg(ex.hedge, hedge_sym, Side.SELL if h > 0 else Side.BUY, qty, "flatten", False)
+                engine.event("warning", "flatten", f"{ex.hedge.name} {hedge_sym}: closed {filled} of {h}", notify=True)
+            if m == 0 and engine.account(ex.hedge.name, 0).position_size(hedge_sym) == 0:
+                break
+        m = engine.account(ex.maker.name, 0).position_size(maker_sym)
+        h = engine.account(ex.hedge.name, 0).position_size(hedge_sym)
+    except VenueError as exc:
+        engine.event("critical", "flatten", f"{ex.name}: flatten failed: {exc}", pair=ex.name, notify=True)
+        return [f"{ex.name}: unknown ({exc})"]
+    ex.rt.direction = 0
+    ex.rt.phase = "build"
+    ex.rt.target_qty = "0"
+    ex.persist()
+    return [f"{ex.name}: {ex.maker.name} {m}, {ex.hedge.name} {h}"] if m or h else []
+
+
+def acquire_run_lock(cfg: Config):
+    """Exclusive lock next to the journal: one running bot per config. Returns the open lock file or None."""
+    import fcntl
+
+    path = Path(cfg.journal_path).with_suffix(".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
 
 
 def ensure_dirs(cfg: Config) -> None:

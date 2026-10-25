@@ -10,13 +10,14 @@ account but cannot withdraw. Info reads must use the main account address.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import time
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
 
 from ..models import BBO, AccountState, Candle, Fill, MarketInfo, OrderBook, OrderState, OrderStatus, Position, Side, Tif
-from ..util import D, ONE, ZERO, quantize_to_step
+from ..util import D, ONE, ZERO, new_client_id, quantize_to_step
 from .base import HttpClient, Venue, VenueError, WeightLimiter
 
 log = logging.getLogger(__name__)
@@ -29,6 +30,9 @@ PERP_MAX_DECIMALS = 6
 MIN_ORDER_NOTIONAL = Decimal(10)
 GROWTH_MODE_FEE_SCALE = Decimal("0.1")
 TIF_WIRE = {Tif.ALO: "Alo", Tif.IOC: "Ioc", Tif.GTT: "Gtc"}
+# Account abstraction modes with separate per-dex balances (what this bot reads and sizes against).
+# In unifiedAccount / portfolioMargin the per-dex clearinghouse states are "not meaningful" (HL docs).
+STANDARD_MODES = ("disabled", "default")
 HL_INTERVALS = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "12h", "1d"}
 INTERVAL_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
                "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "8h": 28_800_000,
@@ -85,10 +89,18 @@ class HyperliquidClient:
             from hyperliquid.exchange import Exchange
 
             wallet = Account.from_key(self.agent_private_key)
-            self._exchange = Exchange(
-                wallet, self.base_url, account_address=self.account_address, perp_dexs=["", *self.dexes]
-            )
+            try:  # the SDK fetches meta for every dex here; without a timeout one stalled call hangs the bot
+                self._exchange = Exchange(wallet, self.base_url, account_address=self.account_address,
+                                          perp_dexs=["", *self.dexes], timeout=self.http.timeout)
+            except Exception as exc:
+                raise VenueError(f"hyperliquid: exchange client setup failed: {exc}", retryable=True) from exc
         return self._exchange
+
+    def account_mode(self) -> str:
+        """userAbstraction of the account: disabled/default (standard), unifiedAccount, portfolioMargin..."""
+        if not self.account_address:
+            raise VenueError("hyperliquid: HL_ACCOUNT_ADDRESS is not set")
+        return str(self.info({"type": "userAbstraction", "user": self.account_address}, 2))
 
 
 class HyperliquidVenue(Venue):
@@ -254,15 +266,26 @@ class HyperliquidVenue(Venue):
 
     # ------------------------------------------------------------------ trading
     def place_order(self, symbol, side, size, price, tif, *, reduce_only=False, client_id=None) -> OrderState:
+        from hyperliquid.utils.types import Cloid
+
         size, price = D(size), D(price)
+        client_id = client_id or new_client_id()
+        cloid = "0x" + hashlib.sha256(client_id.encode()).hexdigest()[:32]
         state = OrderState("", symbol, side, price, size, tif, OrderStatus.PENDING,
                            client_id=client_id, reduce_only=reduce_only, created_ts=time.time())
+        exchange = self.client.exchange
         try:
-            resp = self.client.exchange.order(
+            resp = exchange.order(
                 symbol, side is Side.BUY, float(size), float(price), {"limit": {"tif": TIF_WIRE[tif]}},
-                reduce_only=reduce_only,
+                reduce_only=reduce_only, cloid=Cloid(cloid),
             )
         except Exception as exc:  # the SDK raises plain exceptions on transport errors
+            # The order may have reached the book with the response lost: find it by cloid.
+            found = self._by_cloid(cloid, state)
+            if found is not None:
+                log.warning("%s order %s: response lost (%s) but the order exists: %s", self.name, symbol, exc,
+                            found.status.value)
+                return found
             raise VenueError(f"{self.name} order {symbol}: {exc}", retryable=True) from exc
         if resp.get("status") != "ok":
             state.status = OrderStatus.REJECTED
@@ -286,12 +309,26 @@ class HyperliquidVenue(Venue):
             state.reject_reason = error
         return state
 
+    def _by_cloid(self, cloid: str, state: OrderState) -> OrderState | None:
+        try:
+            body = self.client.info({"type": "orderStatus", "user": self._user(), "oid": cloid}, 2)
+        except VenueError:
+            return None
+        if body.get("status") != "order":
+            return None
+        state.order_id = str(((body["order"] or {}).get("order") or {}).get("oid", ""))
+        return self._apply_status(state, body)
+
     def order_state(self, order: OrderState) -> OrderState:
         if not order.order_id or order.status.done:
             return order
         body = self.client.info({"type": "orderStatus", "user": self._user(), "oid": int(order.order_id)}, 2)
         if body.get("status") != "order":
             return order
+        return self._apply_status(order, body)
+
+    @staticmethod
+    def _apply_status(order: OrderState, body: dict) -> OrderState:
         info = body["order"]
         o = info.get("order") or {}
         orig, remaining = D(o.get("origSz") or order.size), D(o.get("sz") or 0)
@@ -309,15 +346,27 @@ class HyperliquidVenue(Venue):
 
     def cancel_order(self, symbol: str, order_id: str) -> None:
         try:
-            self.client.exchange.cancel(symbol, int(order_id))
+            resp = self.client.exchange.cancel(symbol, int(order_id))
         except Exception as exc:
             raise VenueError(f"{self.name} cancel {order_id}: {exc}", retryable=True) from exc
+        if resp.get("status") != "ok":
+            raise VenueError(f"{self.name} cancel {order_id}: {resp.get('response')}", payload=resp, retryable=True)
+        status = resp["response"]["data"]["statuses"][0]
+        if isinstance(status, dict) and "error" in status:
+            # "Order was never placed, already canceled, or filled": nothing left to cancel.
+            log.info("%s cancel %s: %s", self.name, order_id, status["error"])
 
     def cancel_all(self) -> None:
         # frontendOpenOrders also lists untriggered stop orders
         rows = self.client.info({"type": "frontendOpenOrders", "user": self._user(), "dex": self.dex}, 20)
+        failed = []
         for o in rows:
-            self.cancel_order(o["coin"], str(o["oid"]))
+            try:
+                self.cancel_order(o["coin"], str(o["oid"]))
+            except VenueError as exc:  # keep canceling the rest
+                failed.append(f"{o['coin']} {o['oid']}: {exc}")
+        if failed:
+            raise VenueError(f"{self.name} cancel_all: {len(failed)} failed: {'; '.join(failed)}", retryable=True)
 
     def add_isolated_margin(self, symbol: str, amount: Decimal) -> None:
         try:
@@ -353,7 +402,11 @@ class HyperliquidVenue(Venue):
         info = self.market(symbol)
         if info.isolated_only:
             cross = False
-        resp = self.client.exchange.update_leverage(int(leverage), symbol, is_cross=cross)
+        exchange = self.client.exchange
+        try:
+            resp = exchange.update_leverage(int(leverage), symbol, is_cross=cross)
+        except Exception as exc:
+            raise VenueError(f"{self.name} updateLeverage {symbol}: {exc}", retryable=True) from exc
         if resp.get("status") != "ok":
             raise VenueError(f"{self.name} updateLeverage {symbol}: {resp}", payload=resp)
 

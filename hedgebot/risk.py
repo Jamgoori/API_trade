@@ -5,8 +5,11 @@
   it orders every pair on that venue to cut `derisk_fraction` with IOCs on both legs.
 - Isolated positions (Entropy is isolated-only): distance from mark to the
   liquidation price, same warn / critical ladder.
-- Daily loss: total equity across all venues versus the UTC day start. Breaching
-  `max_daily_loss_pct` halts new risk and rotations (hedged positions are kept).
+- Daily loss: total equity across all venues versus the UTC day start (kept across restarts).
+  Breaching `max_daily_loss_pct` halts new risk and rotations (hedged positions are kept).
+  Deposits, withdrawals and transfers between venues show up as a step in total equity
+  between two checks; such steps move the baseline instead of counting as profit or loss.
+  A halt also lifts once equity is back within half the limit, or at the next UTC day.
 - Positions in markets no pair owns are reported once (manual trades on the bot account).
 """
 
@@ -19,8 +22,11 @@ from decimal import Decimal
 
 from .config import Config
 from .util import ZERO
+from .venues.base import VenueError
 
 log = logging.getLogger(__name__)
+
+TRANSFER_STEP_PCT = Decimal("1.5")  # total equity step between two checks treated as money moving
 
 
 class RiskManager:
@@ -31,6 +37,8 @@ class RiskManager:
         self.day_start_equity: Decimal | None = None
         self.reported_foreign: set[str] = set()
         self.last_derisk: dict[str, float] = {}
+        self.last_total: Decimal | None = None
+        self.topup_next: dict[tuple[str, str], float] = {}
 
     def _pairs_on(self, venue: str) -> list[str]:
         return [p.name for p in self.cfg.pairs if p.enabled and venue in (p.maker.venue, p.hedge.venue)]
@@ -52,8 +60,15 @@ class RiskManager:
         now = now or time.time()
         r = self.cfg.risk
         total = ZERO
+        complete = True
         for name in self.engine.venues:
-            acct = self.engine.account(name, self.cfg.poll.account_s)
+            try:  # one venue being down must not switch off top-ups and de-risk on the others
+                acct = self.engine.account(name, self.cfg.poll.account_s)
+            except VenueError as exc:
+                complete = False
+                self.engine.event("warning", "risk", f"{name}: account read failed ({exc}); risk checks skip it",
+                                  venue=name, throttle_key=f"riskacct:{name}", throttle_s=600)
+                continue
             total += acct.equity
             ratio = acct.margin_ratio
             cross_positions = [p for p in acct.positions.values() if p.margin_mode == "cross"]
@@ -81,8 +96,11 @@ class RiskManager:
                 if pos.liquidation_price is None or pos.mark_price <= 0 or pos.margin_mode != "isolated":
                     continue
                 distance = abs(pos.mark_price - pos.liquidation_price) / pos.mark_price * 100
-                if distance < r.isolated_liq_buffer_warn_pct and r.isolated_topup_enabled:
-                    if self._top_up(name, acct, pos, pair):
+                if distance < r.isolated_liq_buffer_warn_pct and r.isolated_topup_enabled \
+                        and now >= self.topup_next.get((name, symbol), 0):
+                    ok = self._top_up(name, acct, pos, pair)
+                    self.topup_next[(name, symbol)] = now + (10 if ok else 60)  # no tight retry loop on failure
+                    if ok:
                         continue
                 if distance < r.isolated_liq_buffer_critical_pct:
                     self._derisk(pair, f"{symbol} {distance:.1f}% from liquidation", now)
@@ -93,7 +111,8 @@ class RiskManager:
                     self.engine.event("warning", "liq_distance",
                                       f"{name} {symbol}: {distance:.1f}% from liquidation - add margin", venue=name,
                                       pair=pair, notify=True, throttle_key=f"lwarn:{name}:{symbol}", throttle_s=3600)
-        self._daily_loss(total)
+        if complete:  # a missing venue would look like a loss
+            self._daily_loss(total)
 
     def _top_up(self, venue_name: str, acct, pos, pair: str) -> bool:
         """Push the liquidation price of an isolated position back to `isolated_topup_target_pct`.
@@ -131,12 +150,34 @@ class RiskManager:
 
     def _daily_loss(self, total: Decimal) -> None:
         key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        journal = getattr(self.engine, "journal", None)
+        if self.day_key is None and journal is not None:
+            saved = journal.load_pair_state("__risk__") or {}
+            if saved.get("day") == key:
+                self.day_key, self.day_start_equity = key, Decimal(saved["start_equity"])
         if key != self.day_key or self.day_start_equity is None or self.day_start_equity <= 0:
-            self.day_key, self.day_start_equity = key, total
+            self.day_key, self.day_start_equity, self.last_total = key, total, total
+            self._save_day(journal)
             if self.engine.halted and self.engine.halt_reason == "daily loss":
                 self.engine.resume("new UTC day")
             return
+        last, self.last_total = self.last_total, total
+        if last is not None and last > 0 and abs(total - last) / last * 100 >= TRANSFER_STEP_PCT:
+            # A hedged book does not gain or lose this much between two checks: money moved in or out.
+            self.day_start_equity += total - last
+            self._save_day(journal)
+            log.info("total equity stepped %+.0f (deposit / withdrawal / transfer): daily-loss baseline now %.0f",
+                     total - last, self.day_start_equity)
+            return
         loss_pct = (self.day_start_equity - total) / self.day_start_equity * 100
-        if loss_pct >= self.cfg.risk.max_daily_loss_pct and not self.engine.halted:
+        limit = self.cfg.risk.max_daily_loss_pct
+        if loss_pct >= limit and not self.engine.halted:
             self.engine.halt("daily loss", f"equity down {loss_pct:.2f}% today "
-                                           f"(${self.day_start_equity:,.0f} -> ${total:,.0f})")
+                                           f"(${self.day_start_equity:,.0f} -> ${total:,.0f}). If you are moving "
+                                           "money between venues this lifts when it lands")
+        elif self.engine.halted and self.engine.halt_reason == "daily loss" and loss_pct < limit / 2:
+            self.engine.resume(f"equity back to {-loss_pct:+.2f}% of the day start")
+
+    def _save_day(self, journal) -> None:
+        if journal is not None:
+            journal.save_pair_state("__risk__", {"day": self.day_key, "start_equity": str(self.day_start_equity)})

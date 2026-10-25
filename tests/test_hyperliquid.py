@@ -69,3 +69,25 @@ def test_stop_is_reduce_only_market_trigger():
     (args, kw), = ex.calls
     assert args[:4] == ("xyz:NVDA", True, 2.5, 275.0)
     assert args[4] == {"trigger": {"triggerPx": 250.0, "isMarket": True, "tpsl": "sl"}} and kw["reduce_only"]
+
+
+def test_unified_account_mode_is_refused_before_trading():
+    import pytest
+
+    from hedgebot.engine import check_hl_mode
+    from hedgebot.venues.hyperliquid import HyperliquidVenue
+
+    class Client:
+        can_trade = True
+        account_address = "0xabc"
+        network = "mainnet"
+
+        def __init__(self, mode):
+            self.mode = mode
+
+        def account_mode(self):
+            return self.mode
+
+    check_hl_mode({"hl:io": HyperliquidVenue(Client("disabled"), "io")})
+    with pytest.raises(SystemExit, match="unifiedAccount"):
+        check_hl_mode({"hl:io": HyperliquidVenue(Client("unifiedAccount"), "io")})

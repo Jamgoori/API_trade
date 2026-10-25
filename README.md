@@ -47,9 +47,15 @@ io 작업   Arcus SNDK·DRAM·NBIS 메이커          ──체결──▶  Ent
 - **한쪽이 닫힌 뒤**: 손절·청산으로 한쪽 다리가 사라지면 봇이 반대쪽도 바로 정리해서 맨 포지션을 남기지 않고,
   6시간(`stop_cooldown_h`) 쉰 뒤 방향을 새로 정해 증거금이 허락하는 만큼만 다시 쌓습니다. 봇이 꺼져 있던 동안
   손절이 났다면 다시 켜는 즉시 같은 처리를 합니다.
-- **Arcus 데드맨 스위치**: 봇이 죽으면 60초 뒤 Arcus 미체결 주문 자동 취소
+- **봇이 멈추거나 오류가 날 때**: 메이커 주문을 취소하고 이미 체결된 만큼은 헤지한 뒤 종료합니다. 포지션과 거래소 손절은 그대로 둡니다.
+  한 페어에서 예상 못 한 오류가 나도 그 페어만 멈추고 나머지·리스크 관리·손절은 계속 돕니다. 시작할 때 거래소가 안 되면 기다렸다 다시 시도합니다.
+- **헤지 거래소 장애**: Hyperliquid가 20초 넘게 오류를 내면 체결된 Arcus 쪽을 되돌려 한쪽만 남기지 않습니다.
+- **Arcus 데드맨 스위치는 기본으로 끔**: Arcus는 스위치가 발동하면 서브계정의 "모든" 주문을 지우는데, 여기에 Arcus 손절도 포함됩니다
+  (테스트넷에서 확인). 그래서 손절을 지키는 쪽을 택했습니다. 대신 VPS가 통째로 죽으면 걸려 있던 메이커 주문 하나(최대 $2,000×배수)가 남을 수 있고,
+  다시 켜면 봇이 그 체결분을 맞춥니다. `arcus.dead_mans_switch_s`로 켤 수 있습니다.
 - **장외시간 규칙 반영**: Arcus 장외 초기증거금 상향(신규 진입 레버리지 한도), 가격 밴드, 04:00·20:00 ET 경계 전후 3분 진입 금지
-- **일일 비용 예산**($20) 초과 시 회전 중단, **일일 손실 2%** 초과 시 신규 진입 중단(헤지 포지션은 유지)
+- **일일 비용 예산**($20×배수) 초과 시 회전 중단, **일일 손실 2%** 초과 시 신규 진입 중단(헤지 포지션은 유지).
+  입금·출금·거래소 간 이체는 손익으로 치지 않습니다.
 - 재시작해도 상태 유지(SQLite 저널 + 실제 포지션으로 복구)
 
 ---
@@ -112,71 +118,80 @@ Arcus ↔ Entropy 잔고를 3일마다 계획 비율로 되돌리는 경우를 E
 RWA 쪽(trade.xyz)은 리밸런싱 대상에서 뺐습니다.
 
 백테스트가 알 수 없는 것: 메이커 주문이 실제로 체결됐을지(과거 호가창 없음), 실제 스프레드(실측 기반 가정값 사용), 실제 포인트 공식.
-그래서 **3일 모의 거래로 체결률과 비용을 실측**하는 단계가 필요합니다.
+그래서 실전 처음 며칠은 `hedgebot report --hours 24`로 실제 체결률·비용·헤지 지연을 확인하세요.
 
 ---
 
-## 3. 설치 (VPS 권장: 이 클라우드 세션은 계속 켜져 있지 않습니다)
+## 3. 실전 시작 (VPS에서 24시간)
+
+봇은 계속 켜져 있어야 하므로 VPS(Ubuntu 22.04/24.04, 1 vCPU·1GB RAM이면 충분)에서 돌립니다.
+이 클라우드 세션은 계속 켜져 있지 않습니다.
 
 ```bash
-git clone https://github.com/Jamgoori/API_trade && cd API_trade
-python3 -m venv .venv && . .venv/bin/activate      # Python 3.11 이상
-pip install -e ".[dev]"
-cp config.example.yaml config.yaml                   # 금액·종목 수정
-cp .env.example .env                                 # testnet/live 때만 키 입력
-pytest -q                                            # 72개 테스트
+# 1) 설치: 가상환경 + config.yaml/.env 생성 + systemd 서비스 등록
+git clone -b claude/kind-knuth-nt3une https://github.com/Jamgoori/API_trade && cd API_trade
+bash deploy/install.sh
+
+# 2) 키 입력 (아래 5장). 채팅이나 다른 곳에 붙여넣지 마세요
+nano .env
+
+# 3) 키·종목·잔고 확인
+.venv/bin/hedgebot check --mode live
+
+# 4) Hyperliquid 계정이 Standard 모드인지 확인 (통합 계정이면 봇이 시작을 거부합니다)
+.venv/bin/hedgebot hl-mode
+#    "unifiedAccount" 등이면: 웹에서 바꾸거나 아래 명령 후, trade.xyz·Entropy 잔고를 각각 옮기세요
+#    .venv/bin/hedgebot hl-mode --set-standard --i-understand-live
+
+# 5) 주문 기능 점검: 거래소마다 최소 금액(약 $12)으로 실제 주문 걸기 → 거래소 기록과 대조 → 취소,
+#    --fill 이면 최소 수량 진입 → 거래소 손절 걸기/취소 → (Entropy) 격리증거금 $1 추가 → 청산까지
+.venv/bin/hedgebot selftest --mode live --fill --i-understand-live
+
+# 6) 24시간 실행 (재부팅·오류 시 자동 재시작)
+sudo systemctl start hedgebot
+journalctl -u hedgebot -f              # 실시간 로그 (Ctrl+C 로 빠져나와도 봇은 계속 돎)
 ```
 
-## 4. 사용 순서
+| 할 일 | 명령 |
+|---|---|
+| 상태 보기 | `.venv/bin/hedgebot status`, `.venv/bin/hedgebot report --hours 24` |
+| 멈추기 | `sudo systemctl stop hedgebot` (메이커 주문 취소, 포지션과 거래소 손절은 그대로) |
+| 다시 켜기 | `sudo systemctl start hedgebot` (실제 포지션을 읽어 이어서 진행) |
+| 업데이트 | `git pull && .venv/bin/pip install -e . && sudo systemctl restart hedgebot` |
+| 리밸런싱 금액 | `.venv/bin/hedgebot rebalance` |
+| 비상 전체 청산 | `sudo systemctl stop hedgebot && .venv/bin/hedgebot flatten --mode live --confirm --i-understand-live` |
 
-### ① 종목 확인 (키 필요 없음)
-```bash
-hedgebot scan                # Arcus RWA ↔ trade.xyz / Entropy 공통 종목, 펀딩비, 스프레드, 레버리지 한도
-```
+`selftest`와 `flatten`은 봇이 돌고 있으면 실행을 거부합니다(먼저 `sudo systemctl stop hedgebot`).
+설치 스크립트가 만드는 `config.yaml`은 `mode: live`입니다. 모의 거래(`--mode paper`)는 별도 저널(`data/journal-paper.sqlite`)을 써서 실전 상태와 섞이지 않습니다.
 
-### ② 백테스트 (키 필요 없음)
+### 자금을 더 넣을 때 (설정 수정 필요 없음)
+
+`sizing.scale_with_equity: true`(기본)면 모든 페어 크기가 **실제 잔고 합계 ÷ `capital` 합계** 배수로 자동 조정됩니다.
+
+- `capital`은 1배 기준값입니다(기본 $18k). 잔고가 $36k가 되면 모든 포지션 목표가 2배가 됩니다.
+- **입금**: 늘어난 잔고가 30분 유지되면 크기를 키웁니다. 텔레그램으로 "position size x1.00 -> x2.00"이 옵니다.
+- **비율대로 나눠 넣으세요**: 한 거래소에만 넣으면 돈이 적은 쪽 한도까지만 커집니다. 봇이 3일마다 알려 주는 리밸런싱 금액대로 옮기면 됩니다(`hedgebot rebalance`).
+- **거래소 간 이체 중**에는 잔고 합계가 잠깐 줄어 보입니다. 감소는 6시간 넘게 이어질 때만 반영되므로 이체 때문에 포지션을 줄이지 않습니다.
+  일일 손실 한도(2%)가 이체 때문에 걸려도, 돈이 도착해서 잔고가 회복되면 자동으로 풀립니다.
+- **출금**: 줄어든 잔고가 6시간 유지되면 크기를 줄입니다.
+- 클립 크기($600~2,000)는 그대로라서 크기가 커지면 다 쌓는 데 시간이 더 걸립니다. 하루 비용 예산은 배수만큼 같이 늘어납니다.
+- 배수 범위는 0.25~10배(`sizing.min_scale / max_scale`)입니다. 3배 이상 키울 때는 `hedgebot scan`으로 Entropy 종목의 거래량과 OI를 먼저 보세요.
+
+## 4. 그 밖의 사용법
+
 ```bash
-hedgebot backtest --days 45            # config.yaml 기준
+hedgebot scan                          # Arcus RWA ↔ trade.xyz / Entropy 공통 종목, 펀딩비, 스프레드, 레버리지 한도
+hedgebot backtest --days 45            # config.yaml 기준 (백테스트는 고정 크기)
 hedgebot backtest --days 45 --sweep    # 회전 주기·규모·헤지 방식 비교
-hedgebot backtest --days 100 --interval 1h
+hedgebot run --mode paper              # 키 없이 실시세 모의 거래
+hedgebot rebalance --apply             # paper 모드에서만: 모의 잔고에 이체 반영
 ```
-옵션: `--half-spread arcus=0.3:0.5,hl:xyz=0.3:0.5,hl:io=0.8:1.2`, `--passive-hedge-fill-rate 0.5`, `--points-per-musd 33`, `--no-transfers`
+백테스트 옵션: `--half-spread arcus=0.3:0.5,hl:xyz=0.3:0.5,hl:io=0.8:1.2`, `--passive-hedge-fill-rate 0.5`,
+`--points-per-musd 33`, `--no-transfers`, `--rebalance-every-h 72`.
+`paper.maker_fill: through`(기본)는 가격이 내 호가를 **뚫고 지나가야** 체결로 보는 보수적인 설정입니다.
 
-### ③ 3일 모의 거래 (키 필요 없음, 실시세 사용)
-```bash
-tmux new -s hedgebot
-hedgebot run --mode paper              # Ctrl+B, D 로 빠져나와도 계속 실행
-hedgebot report                        # 언제든 중간 결과
-hedgebot report --hours 72             # 3일 리포트 + 체크리스트
-```
-- `paper.maker_fill: through`(기본)는 가격이 내 호가를 **뚫고 지나가야** 체결로 봅니다. 보수적인 설정입니다.
-- 리포트의 체크리스트: 헤지 실패 0, 불균형 수리 하루 1회 이하, 청산·축소 0, 정지 0, 헤지 지연 p95 5초 미만, 가동률 95% 이상.
-
-### ④ 테스트넷 (선택)
-```bash
-hedgebot check --mode testnet          # 키·종목·잔고 확인
-hedgebot run --mode testnet
-```
-Entropy는 테스트넷에 없어서 `hl:io` 페어는 자동으로 빠집니다. Arcus 테스트넷은 웹에서 Testnet Deposit(약 $1,000)을 받으세요.
-
-### ⑤ 실거래 (소액부터)
-```bash
-hedgebot check --mode live
-hedgebot run --mode live --i-understand-live
-```
-처음 1~2주는 `config.yaml`의 `notional_usd`를 줄여서($500~1,000 규모) 실제 수수료와 포인트를 확인한 뒤 늘리세요.
-
-### 리밸런싱 (돈은 직접 이체)
-```bash
-hedgebot rebalance                              # 지금 옮겨야 할 금액과 방향
-hedgebot rebalance --apply                      # paper 모드에서만: 모의 잔고에 이체를 반영
-hedgebot backtest --days 45 --rebalance-every-h 72
-```
-
-### 비상 정리
-```bash
-hedgebot flatten --mode live --confirm --i-understand-live   # 모든 봇 포지션을 양쪽 다 시장가로 청산
-```
+테스트넷: Entropy(io)는 Hyperliquid 테스트넷에 없고, Arcus 테스트넷은 호가 간격이 수 %라서 전략 테스트에는 맞지 않습니다.
+주문 기능 확인은 위 `selftest`(실전, 최소 금액)로 합니다.
 
 ---
 
@@ -188,12 +203,17 @@ hedgebot flatten --mode live --confirm --i-understand-live   # 모든 봇 포지
 | `ARCUS_ETH_ADDRESS` | 그 키를 등록한 지갑 주소 | |
 | `HL_ACCOUNT_ADDRESS` | Hyperliquid **메인 지갑 주소** (잔고가 있는 주소) | |
 | `HL_AGENT_PRIVKEY` | app.hyperliquid.xyz/API 에서 Generate 한 **API 지갑 개인키** | 거래 전용, 출금 불가 |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | 알림 (선택) | |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | 알림 (강력 권장: 경고·리밸런싱·크기 변경을 받는 유일한 통로) | |
 
-- 키는 `.env`에만 두세요. `.env`는 git에 올라가지 않습니다. 채팅에 붙여넣지 마세요.
-- **Arcus는 봇 전용 서브계정을 권장합니다.** 봇은 testnet/live 시작 시 해당 서브계정의 미체결 주문을 모두 취소합니다.
-  API 키 발급 화면에서 Subaccount #를 고르고 `arcus.account_index`를 같게 맞추세요.
-- HL API 지갑은 거래소(dex) 간 자금 이동을 못 합니다. 잔고 경고가 오면 웹에서 직접 옮기세요.
+- 키는 `.env`에만 두세요(설치 스크립트가 본인만 읽을 수 있게 권한 600으로 만듭니다). `.env`는 git에 올라가지 않습니다.
+- **키에는 만료일이 있습니다.** Arcus API 키는 최대 180일, Hyperliquid API 지갑도 유효기간을 정해 발급합니다.
+  발급할 때 가장 길게 잡고 만료 전에 새로 발급해 `.env`를 바꾼 뒤 `sudo systemctl restart hedgebot` 하세요. 만료되면 주문이 거부되고 오류 알림이 옵니다.
+- **봇 전용 계정을 쓰세요.** 봇은 시작할 때 그 계정의 미체결 주문을 모두 취소하고, 봇이 모르는 종목의 포지션은 알림만 보냅니다.
+  Arcus는 API 키 발급 화면에서 Subaccount #를 고르고 `arcus.account_index`를 같게 맞추세요.
+  Hyperliquid에서 직접 거래도 한다면 봇 전용 지갑(새 주소)을 따로 만들어 쓰세요(봇은 HL 서브계정 거래를 지원하지 않습니다).
+- HL API 지갑은 거래소(dex) 간 자금 이동을 못 합니다. 이체는 웹에서 직접 하세요.
+- **Hyperliquid 계정은 Standard(수동) 모드여야 합니다.** 통합 계정(unified)·포트폴리오 마진에서는 trade.xyz·Entropy 잔고가 따로 보이지 않아
+  크기 조정·증거금 보충·손실 한도가 틀린 숫자로 돌기 때문에, 봇이 시작을 거부합니다. HL도 자동매매에는 Standard를 권장합니다.
 
 ---
 
@@ -201,12 +221,14 @@ hedgebot flatten --mode live --confirm --i-understand-live   # 모든 봇 포지
 
 | 키 | 기본값 | 설명 |
 |---|---|---|
-| `capital` | arcus 8000 / hl:xyz 2000 / hl:io 8000 | 거래소별 자금 (paper 잔고). RWA 약 22% / io 약 78% |
+| `capital` | arcus 8000 / hl:xyz 2000 / hl:io 8000 | 크기의 1배 기준 + 리밸런싱 비율 (paper에서는 모의 잔고). RWA 약 22% / io 약 78% |
+| `sizing.scale_with_equity` | true | 실제 잔고 합계 ÷ `capital` 합계만큼 모든 페어 크기를 자동 조정 (늘 때 30분, 줄 때 6시간 유지 확인, 0.25~10배) |
+| `arcus.dead_mans_switch_s` | 0 (끔) | 켜면(5~300초) 봇이 멈췄을 때 Arcus 주문이 모두 취소되는데, Arcus 손절도 같이 사라집니다 |
 | `pairs[].notional_usd`, `leverage`, `direction` | | 페어별 명목가, 레버리지, `auto` / `long_maker` / `short_maker` |
 | `pairs[].rotate`, `min_hold_h`, `max_hold_h`, `rotation_fraction_min/max` | io: 24~48h, 30~60% | 페어별 회전 설정. `rotate: false`면 보유만 |
 | `strategy.min_hold_h / max_hold_h` | 6 / 12 | 회전 간격. 짧을수록 포인트↑ 비용↑ |
 | `strategy.rotate_when` | off_hours | Arcus 장외시간(20:00~04:00 ET, 주말)에만 회전 |
-| `strategy.max_daily_cost_usd` | 20 | 하루 수수료+슬리피지 한도 |
+| `strategy.max_daily_cost_usd` | 20 | 하루 수수료+슬리피지 한도 (크기 배수만큼 같이 늘어남) |
 | `strategy.basis_guard_bps` | 8 | 두 거래소 가격 차이가 평소보다 이만큼 불리하면 대기 |
 | `execution.hedge_mode` | passive_first | `taker`로 바꾸면 즉시 테이커 헤지 |
 | `risk.margin_ratio_warn / critical` | 3.0 / 1.7 | 자산÷유지증거금. 경고(입금 안내) / 자동 30% 축소 |
@@ -219,13 +241,26 @@ hedgebot flatten --mode live --confirm --i-understand-live   # 모든 봇 포지
 
 ---
 
-## 7. 알려진 한계와 확인할 것
+## 7. 실제 서버에서 확인한 것과 남은 것
+
+버리는 지갑(잔고 없음)으로 실제 거래소에 서명된 요청을 보내 확인했습니다(2026-10-25).
+
+| 항목 | 결과 |
+|---|---|
+| Arcus 테스트넷: API 키 등록, 주문(서명·가격·수량 변환), 거래소 기록 대조, 취소, 손절(positionTpsl), 레버리지, 전체 취소, 계정·미체결·체결 조회 | 통과 |
+| Arcus 데드맨 스위치 | 15초 뒤 미체결 주문 취소 확인. **손절도 같이 취소됨** → 기본 끔 |
+| Hyperliquid 메인넷·테스트넷: 주문·레버리지·트리거 손절·격리증거금 서명 (서버가 복원한 서명자 = 지갑 주소) | 통과 |
+| HIP-3 종목 매핑 (xyz:NVDA → 110002, io:SNDK → 200002) | 공개 메타데이터와 일치 |
+
+아직 실제로 확인하지 못한 것 (잔고가 있어야 함): 실제 체결, 체결 후 포지션·청산가 읽기, Entropy 격리증거금 추가.
+처음 실전에서 `hedgebot selftest --mode live --fill`이 바로 이 부분을 최소 금액으로 확인합니다.
+
+그 밖에:
 
 1. **Arcus 퍼프 접근 권한**: 화이트리스트에 없는 주소는 API가 `address not on access whitelist`를 반환합니다. `hedgebot check`로 확인하세요.
-2. **데드맨 스위치 서명 방식**: Arcus 문서에 `scheduleCancel`의 서명 방식이 명시되지 않아 `setLeverage`와 같은 방식으로 구현했습니다. 실패하면 봇은 경고만 내고 계속 돌지만, 그러면 봇이 죽었을 때 Arcus 미체결 주문이 남을 수 있습니다. 테스트넷에서 경고가 없는지 확인하세요.
-3. **HIP-3 수수료**: trade.xyz·Entropy 종목 대부분이 Growth mode(수수료 90% 할인)라는 공개 정보로 계산했습니다. 실거래에서는 10분마다 실제 체결 수수료를 받아 저널에 기록합니다(`report`의 reconciled fees).
-4. **포인트**: 공식 계산식은 비공개입니다. 리포트의 포인트 추정치는 `points.arcus_points_per_musd` 가정입니다. 매주 수요일 실제 배분과 비교해 보정하세요(`hedgebot report --points-per-musd X`).
-5. **Entropy 테스트넷 없음**: Entropy 쪽은 모의 거래 후 소액 실거래로만 검증할 수 있습니다.
+2. **HIP-3 수수료**: trade.xyz·Entropy 종목 대부분이 Growth mode(수수료 90% 할인)라는 공개 정보로 계산했습니다. 실거래에서는 10분마다 실제 체결 수수료를 받아 저널에 기록합니다(`report`의 reconciled fees).
+3. **포인트**: 공식 계산식은 비공개입니다. 리포트의 포인트 추정치는 `points.arcus_points_per_musd` 가정입니다. 매주 수요일 실제 배분과 비교해 보정하세요(`hedgebot report --points-per-musd X`).
+4. **교차증거금 손절 위치**: 모든 종목이 같이 움직인다고 가정해 잡습니다(청산 쪽으로 보수적). 한 종목만 크게 움직이면(SNDK 하루 ±13% 등) 봇의 축소보다 먼저 그 종목의 Arcus 손절이 나갈 수 있고, 봇이 반대쪽을 정리한 뒤 6시간 쉬고 다시 쌓습니다.
 
 ---
 
@@ -241,8 +276,11 @@ hedgebot/
   backstop.py            거래소에 걸어 두는 손절 주문 관리
   rebalance.py           거래소 간 리밸런싱 이체 계산
   strategy.py            방향·회전·베이시스·사이징 규칙 (실거래와 백테스트가 공유)
-  engine.py              메인 루프, 데드맨 스위치, 스냅샷, 수수료 대조
+  engine.py              메인 루프, 시작·종료, 잔고 비례 크기, 스냅샷, 수수료 대조, 비상 청산
+  sizing.py              입금·출금에 맞춘 크기 배수 (늘 때 30분, 줄 때 6시간 유지 확인)
+  selftest.py            실전 최소 금액 주문 점검
   backtest/              과거 캔들·펀딩 재생 시뮬레이터
   scanner.py, report.py, journal.py, cli.py
-tests/                   72개 (서명, 체결, 헤지 실패, 불균형, 회전, 리스크, 거래소 손절, 백테스트)
+deploy/                  install.sh (VPS 설치), hedgebot.service (systemd)
+tests/                   99개 (서명, 체결, 헤지 실패·장애, 불균형, 회전, 리스크, 거래소 손절, 크기 배수, 엔진, 백테스트)
 ```

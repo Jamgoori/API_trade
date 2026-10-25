@@ -66,7 +66,10 @@ def pair_rotation(pair: PairConfig, s: "StrategyConfig") -> Rotation:
 @dataclass
 class ArcusConfig:
     account_index: int = 0
-    dead_mans_switch_s: int = 60
+    # Arcus dead man's switch: cancel ALL orders of the subaccount if the bot stops refreshing it.
+    # That includes the exchange stop-losses on Arcus positions, so it is off by default
+    # (the bot cancels its own maker orders when it stops or crashes). 5-300 s when enabled.
+    dead_mans_switch_s: int = 0
     margin_mode: str = "cross"  # cross | isolated
 
 
@@ -177,6 +180,24 @@ class RebalanceConfig:
 
 
 @dataclass
+class SizingConfig:
+    """Grow or shrink every pair with the money actually on the venues.
+
+    scale = total live equity / total `capital`; each pair targets notional_usd x scale. Deposits are
+    picked up after `grow_after_min`; a drop (withdrawal, money in transit between venues) must last
+    `shrink_after_h` before positions are cut. Changes under `min_change_pct` are ignored.
+    """
+
+    scale_with_equity: bool = True
+    check_min: float = 5
+    min_change_pct: Decimal = Decimal(10)
+    grow_after_min: float = 30
+    shrink_after_h: float = 6
+    min_scale: Decimal = Decimal("0.25")
+    max_scale: Decimal = Decimal(10)
+
+
+@dataclass
 class PointsConfig:
     # Community self-reports: ~41-46 Arcus points per $1.2-1.5M of mostly-RWA volume per week.
     arcus_points_per_musd: Decimal = Decimal(33)
@@ -196,6 +217,7 @@ class Config:
     paper: PaperConfig = field(default_factory=PaperConfig)
     points: PointsConfig = field(default_factory=PointsConfig)
     rebalance: RebalanceConfig = field(default_factory=RebalanceConfig)
+    sizing: SizingConfig = field(default_factory=SizingConfig)
     journal_path: str = "data/journal.sqlite"
     log_dir: str = "data/logs"
 
@@ -353,6 +375,18 @@ def validate(cfg: Config) -> None:
             raise ConfigError(f"rebalance: set capital for {missing} (it defines the target split)")
         if rb.every_h <= 0:
             raise ConfigError("rebalance.every_h must be positive")
+    for name, mode in (("arcus", cfg.arcus.margin_mode), ("hyperliquid", cfg.hyperliquid.margin_mode)):
+        if mode not in ("cross", "isolated"):
+            raise ConfigError(f"{name}.margin_mode must be cross or isolated (got {mode!r})")
+    dms = cfg.arcus.dead_mans_switch_s
+    if dms and not (5 <= dms <= 300):
+        raise ConfigError("arcus.dead_mans_switch_s must be 0 (off) or 5-300 seconds")
+    z = cfg.sizing
+    if z.scale_with_equity:
+        if not (0 < z.min_scale <= 1 <= z.max_scale):
+            raise ConfigError("sizing: need 0 < min_scale <= 1 <= max_scale")
+        if z.min_change_pct <= 0 or z.check_min <= 0:
+            raise ConfigError("sizing: min_change_pct and check_min must be positive")
     for name in cfg.venues_needed():
         if name.startswith("hl:") and name[3:] not in cfg.hyperliquid.dexes:
             raise ConfigError(f"venue {name} is used by a pair but not listed in hyperliquid.dexes")

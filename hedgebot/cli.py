@@ -1,4 +1,4 @@
-"""Command line entry point: scan | backtest | run | report | status | check | flatten."""
+"""Command line entry point: scan | backtest | run | report | status | check | selftest | rebalance | flatten."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
 from .config import Config, ConfigError, Secrets, load_config
 
@@ -58,6 +58,11 @@ def _load(args) -> Config:
         raise SystemExit(f"config error: {exc}") from exc
     if getattr(args, "mode", None):
         cfg.mode = args.mode
+    if cfg.mode != "live":  # paper/testnet state must never steer live sizing, daily loss or pair state
+        jp = Path(cfg.journal_path)
+        cfg.journal_path = str(jp.with_name(f"{jp.stem}-{cfg.mode}{jp.suffix}"))
+    if path.name == "config.example.yaml" and args.config == "config.yaml" and cfg.mode in ("testnet", "live"):
+        raise SystemExit("testnet/live needs your own config.yaml: cp config.example.yaml config.yaml")
     return cfg
 
 
@@ -188,6 +193,15 @@ def cmd_backtest(args) -> int:
 
 
 # ----------------------------------------------------------------------- run
+def _require_bot_stopped(cfg) -> object:
+    from .engine import acquire_run_lock
+
+    lock = acquire_run_lock(cfg)
+    if lock is None:
+        raise SystemExit("the bot is running with this config (sudo systemctl stop hedgebot first)")
+    return lock
+
+
 def cmd_run(args) -> int:
     from .engine import Engine, ensure_dirs
 
@@ -195,6 +209,7 @@ def cmd_run(args) -> int:
     if cfg.mode == "live" and not args.i_understand_live:
         raise SystemExit("live mode trades real money. Re-run with --i-understand-live after the paper test.")
     ensure_dirs(cfg)
+    lock = _require_bot_stopped(cfg)  # noqa: F841  (held for the life of the process)
     add_file_log(cfg.log_dir)
     secrets = Secrets.from_env()
     engine = Engine(cfg, secrets)
@@ -219,8 +234,11 @@ def cmd_status(args) -> int:
 
     cfg = _load(args)
     journal = Journal(cfg.journal_path)
+    print(f"mode={cfg.mode} journal={cfg.journal_path}")
     for p in cfg.pairs:
         print(f"{p.name}: {journal.load_pair_state(p.name)}")
+    for key in ("__sizing__", "__risk__", "__rebalance__"):
+        print(f"{key.strip('_')}: {journal.load_pair_state(key)}")
     snaps = journal.snapshots_between(time.time() - 3600 * 6, time.time() + 1)
     latest = {}
     for s in snaps:
@@ -268,9 +286,78 @@ def cmd_check(args) -> int:
     if trading and "arcus" in venues:
         signer = venues["arcus"].signer
         print(f"  arcus API key (public): {signer.api_key} for {signer.address} subaccount {signer.account_index}")
+    hl = next((v for v in venues.values() if hasattr(v, "client")), None)
+    if trading and hl is not None:
+        from .venues.hyperliquid import STANDARD_MODES
+
+        try:
+            mode = hl.client.account_mode()
+            good = mode in STANDARD_MODES
+            print(f"  hyperliquid account mode: {mode} ({'ok' if good else 'needs Standard mode: hedgebot hl-mode'})")
+            ok &= good
+        except Exception as exc:
+            ok = False
+            print(f"  hyperliquid account mode FAILED: {exc}")
     print("telegram:", "on" if secrets.telegram_token and secrets.telegram_chat else "off")
     print("OK" if ok else "PROBLEMS FOUND")
     return 0 if ok else 1
+
+
+def cmd_selftest(args) -> int:
+    from decimal import Decimal
+
+    from .engine import build_market_venues
+    from .selftest import check_venue, format_reports, pick_symbols
+    from .venues.arcus import ArcusVenue
+
+    cfg = _load(args)
+    if cfg.mode == "paper":
+        raise SystemExit("selftest places real orders: use --mode testnet or --mode live")
+    if cfg.mode == "live" and not args.i_understand_live:
+        raise SystemExit("this places real orders (about $12 per venue; with --fill it also opens and closes "
+                         "that much); add --i-understand-live")
+    lock = _require_bot_stopped(cfg)  # noqa: F841
+    only = args.venue.split(",") if args.venue else None
+    picked = pick_symbols(cfg, only)
+    if not picked:
+        raise SystemExit("no enabled pair uses the requested venue(s)")
+    venues = build_market_venues(cfg, Secrets.from_env(), trading=True)
+    print(f"mode={cfg.mode} network={cfg.network} - run this with the bot stopped")
+    reports = []
+    for name, (symbol, leverage, cross) in picked.items():
+        venue = venues[name]
+        venue.refresh_markets()
+        if isinstance(venue, ArcusVenue):
+            venue.sync_clock()
+        report = check_venue(venue, symbol, leverage, cross, fill=args.fill, usd=Decimal(str(args.usd)))
+        reports.append(report)
+        print(format_reports([report]))
+    ok = all(r.ok for r in reports)
+    print("OK" if ok else "PROBLEMS FOUND")
+    return 0 if ok else 1
+
+
+def cmd_hl_mode(args) -> int:
+    from .engine import build_market_venues
+    from .venues.hyperliquid import STANDARD_MODES
+
+    cfg = _load(args)
+    if cfg.mode == "paper":
+        cfg.mode = "live"
+    hl = next((v for v in build_market_venues(cfg, Secrets.from_env(), trading=True).values()
+               if hasattr(v, "client")), None)
+    if hl is None:
+        raise SystemExit("no Hyperliquid venue in the config")
+    mode = hl.client.account_mode()
+    print(f"{hl.client.account_address}: {mode}" + (" (standard: ok)" if mode in STANDARD_MODES else ""))
+    if not args.set_standard or mode in STANDARD_MODES:
+        return 0
+    if cfg.mode == "live" and not args.i_understand_live:
+        raise SystemExit("add --i-understand-live to change the account mode")
+    resp = hl.client.exchange.agent_set_abstraction("i")
+    print("set Standard mode:", resp)
+    print("now", hl.client.account_mode(), "- move USDC into the xyz and io dexes in the Hyperliquid app")
+    return 0 if isinstance(resp, dict) and resp.get("status") == "ok" else 1
 
 
 def cmd_rebalance(args) -> int:
@@ -312,13 +399,13 @@ def cmd_flatten(args) -> int:
     if cfg.mode == "live" and not args.i_understand_live:
         raise SystemExit("add --i-understand-live to flatten real positions")
     ensure_dirs(cfg)
+    lock = _require_bot_stopped(cfg)  # noqa: F841
     engine = Engine(cfg, Secrets.from_env())
-    flatten_all(engine)
-    return 0
+    return 1 if flatten_all(engine) else 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_dotenv()
+    load_dotenv(find_dotenv(usecwd=True))  # .env next to config.yaml in the working directory
     parser = argparse.ArgumentParser(prog="hedgebot", description="Arcus <-> Hyperliquid HIP-3 hedge points bot")
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -358,16 +445,33 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_run)
 
     p = with_config(sub.add_parser("report", help="summarise a run from the journal"))
+    p.add_argument("--mode", choices=["paper", "testnet", "live"])
     p.add_argument("--hours", type=float, help="only the last N hours")
     p.add_argument("--points-per-musd", type=float)
     p.set_defaults(func=cmd_report)
 
     p = with_config(sub.add_parser("status", help="pair states and latest account snapshots"))
+    p.add_argument("--mode", choices=["paper", "testnet", "live"])
     p.set_defaults(func=cmd_status)
 
     p = with_config(sub.add_parser("check", help="validate config, market symbols, credentials"))
     p.add_argument("--mode", choices=["paper", "testnet", "live"])
     p.set_defaults(func=cmd_check)
+
+    p = with_config(sub.add_parser("selftest", help="place, read back and cancel real minimum-size orders"))
+    p.add_argument("--mode", choices=["testnet", "live"])
+    p.add_argument("--venue", help="comma list, e.g. arcus,hl:io (default: every venue in the config)")
+    p.add_argument("--fill", action="store_true",
+                   help="also open the minimum size, place and cancel a stop, add isolated margin, then close")
+    p.add_argument("--usd", type=float, default=12, help="test order size in USD (raised to the venue minimum)")
+    p.add_argument("--i-understand-live", action="store_true")
+    p.set_defaults(func=cmd_selftest)
+
+    p = with_config(sub.add_parser("hl-mode", help="show / set the Hyperliquid account mode (needs Standard)"))
+    p.add_argument("--mode", choices=["testnet", "live"])
+    p.add_argument("--set-standard", action="store_true", help="switch the account to Standard (separate dex balances)")
+    p.add_argument("--i-understand-live", action="store_true")
+    p.set_defaults(func=cmd_hl_mode)
 
     p = with_config(sub.add_parser("rebalance", help="how much to move between venues to get back to plan"))
     p.add_argument("--mode", choices=["paper", "testnet", "live"])

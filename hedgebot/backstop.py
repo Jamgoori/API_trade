@@ -29,6 +29,9 @@ log = logging.getLogger(__name__)
 
 SIZE_DRIFT = Decimal("0.10")
 TRIGGER_DRIFT = Decimal("0.01")
+# A leg that only fails after a move this large gets no stop: it adds no protection, and venues
+# reject trigger orders priced that far from the oracle (Hyperliquid: 95%). Placed once it comes closer.
+MAX_STOP_DISTANCE = Decimal("0.5")
 
 
 @dataclass
@@ -59,6 +62,8 @@ def stop_trigger(acct: AccountState, pos: Position, backstop_ratio: Decimal, iso
     # must sit on the protective side of the current mark, otherwise the bot is already de-risking
     if (long and trigger >= pos.mark_price) or (not long and trigger <= pos.mark_price) or trigger <= 0:
         return None
+    if abs(trigger - pos.mark_price) / pos.mark_price > MAX_STOP_DISTANCE:
+        return None
     return trigger
 
 
@@ -69,19 +74,38 @@ class BackstopManager:
         self.active: dict[tuple[str, str], Backstop] = {}
 
     def _legs(self):
+        # Busy pairs too: a pair builds or rotates for hours in back-to-back clips, and a reduce-only,
+        # position-sized stop is safe mid-clip. Only skipped while a hedge is in flight.
         for ex in self.engine.executors:
-            if ex.busy:
-                continue  # position is changing; refresh after the clip
+            if ex.clip is not None and (ex.clip.hedge_pending > 0 or ex.clip.hedge_order is not None):
+                continue
             yield ex, ex.pair.maker.venue, ex.pair.maker.symbol
             yield ex, ex.pair.hedge.venue, ex.pair.hedge.symbol
 
-    def _cancel(self, key: tuple[str, str]) -> None:
-        bs = self.active.pop(key, None)
-        if bs and not bs.order.status.done:
+    def _cancel(self, key: tuple[str, str], wait_s: float = 0) -> bool:
+        """Cancel a tracked stop. False (still tracked, retried next refresh) when the cancel failed.
+
+        Arcus cancels asynchronously and allows one position stop per market, so a replacement
+        waits up to `wait_s` for the old one to be gone.
+        """
+        bs = self.active.get(key)
+        if bs is None:
+            return True
+        venue = self.engine.venues[key[0]]
+        if not bs.order.status.done:
             try:
-                self.engine.venues[key[0]].cancel_order(key[1], bs.order.order_id)
+                venue.cancel_order(key[1], bs.order.order_id)
+                deadline = time.time() + wait_s
+                while time.time() < deadline:
+                    bs.order = venue.order_state(bs.order)
+                    if bs.order.status.done:
+                        break
+                    time.sleep(0.5)
             except VenueError as exc:
                 log.warning("cancel stop %s %s failed: %s", key[0], key[1], exc)
+                return False
+        self.active.pop(key, None)
+        return True
 
     def refresh(self) -> None:
         r = self.cfg.risk
@@ -97,6 +121,8 @@ class BackstopManager:
                         self.engine.event("critical", "stop_fired",
                                           f"{venue_name} {symbol}: exchange stop fired at ~{current.trigger:.4f}",
                                           pair=ex.name, venue=venue_name, notify=True)
+                    elif current.order.status is OrderStatus.REJECTED:
+                        self._rejected(venue_name, symbol, current.order.reject_reason)
                     if current.order.status.done:
                         self.active.pop(key, None)
                         current = None
@@ -110,16 +136,17 @@ class BackstopManager:
                     continue
                 trigger = venue.round_price(symbol, trigger, "nearest")
                 size = abs(pos.size)
-                if current and not self._stale(current, trigger, size, pos.mark_price, venue_name):
+                if current and not self._stale(current, trigger, size, pos.mark_price, venue_name,
+                                               sized_only=ex.busy):
                     continue
-                if current:
-                    self._cancel(key)
+                if current and ex.busy and venue_name == "arcus":
+                    continue  # Arcus stops resize themselves; trigger drift waits until the clip is done
+                if current and not self._cancel(key, wait_s=5 if venue_name == "arcus" else 0):
+                    continue
                 side = Side.SELL if pos.size > 0 else Side.BUY
                 order = venue.place_stop(symbol, side, size, trigger)
                 if order.status is OrderStatus.REJECTED:
-                    self.engine.event("warning", "stop_rejected", f"{venue_name} {symbol}: stop rejected: "
-                                      f"{order.reject_reason}", venue=venue_name, notify=True,
-                                      throttle_key=f"stoprej:{venue_name}:{symbol}", throttle_s=3600)
+                    self._rejected(venue_name, symbol, order.reject_reason)
                     continue
                 self.active[key] = Backstop(order, order.trigger_price or trigger, size, time.time())
                 log.info("%s %s: exchange stop %s %s @ %s", venue_name, symbol, side.value, size,
@@ -128,11 +155,16 @@ class BackstopManager:
                 self.engine.event("warning", "stop_error", f"{venue_name} {symbol}: stop refresh failed: {exc}",
                                   venue=venue_name, throttle_key=f"stoperr:{venue_name}", throttle_s=1800)
 
+    def _rejected(self, venue_name: str, symbol: str, reason: str | None) -> None:
+        self.engine.event("warning", "stop_rejected", f"{venue_name} {symbol}: stop rejected: {reason}",
+                          venue=venue_name, notify=True, throttle_key=f"stoprej:{venue_name}:{symbol}", throttle_s=3600)
+
     @staticmethod
-    def _stale(bs: Backstop, trigger: Decimal, size: Decimal, mark: Decimal, venue_name: str) -> bool:
+    def _stale(bs: Backstop, trigger: Decimal, size: Decimal, mark: Decimal, venue_name: str,
+               sized_only: bool = False) -> bool:
         if venue_name != "arcus" and bs.size > 0 and abs(size - bs.size) / bs.size > SIZE_DRIFT:
             return True  # Arcus stops are position-level and resize themselves
-        return mark > 0 and abs(trigger - bs.trigger) / mark > TRIGGER_DRIFT
+        return not sized_only and mark > 0 and abs(trigger - bs.trigger) / mark > TRIGGER_DRIFT
 
     def cancel_all(self) -> None:
         for key in list(self.active):
