@@ -6,17 +6,17 @@
 
 mode: paper            # paper(실시세 모의) | testnet | live
 
-# 자금 배분 (총 $14,000 예시)
-#   RWA 작업 25% ($3,500)  = Arcus $1,750 + trade.xyz $1,750   -> Arcus RWA 종목을 trade.xyz 로 헤지
-#   io 작업  75% ($10,500) = Entropy $4,500 + Arcus $6,000     -> Entropy 종목을 Arcus 로 헤지 (주력)
-#   Entropy 는 증거금을 놀리지 않게 전액 투입: $4,500 x 5배 = $22.5k 목표 (실제로는 증거금 한도까지 약 $20~21k 유지).
-#   Arcus 쪽 여유 증거금은 놀고 있는 돈이 아니라 교차증거금 쿠션입니다(헤지 다리가 청산되지 않게 받쳐 줌).
-#   3일마다 리밸런싱 전제. 백테스트(45일): Entropy OI 평균 $20.5k, 손익 +$65, 청산가 최근접 5.5%, Arcus 증거금 비율 최저 2.95
+# 자금 배분 (총 $18,000 예시: Arcus $8,000 / Entropy $8,000 / trade.xyz $2,000)
+#   RWA 작업 ($4,000)  = Arcus 약 $2,000 + trade.xyz $2,000  -> Arcus RWA 종목을 trade.xyz 로 헤지
+#   io 작업  ($14,000) = Entropy $8,000 + Arcus 약 $6,000    -> Entropy 종목을 Arcus 로 헤지 (주력)
+#   Entropy 목표 $27k (5배 기준 증거금 $5.4k). 나머지 $2.6k 는 노는 돈이 아니라 청산가에 가까워지면
+#   자동으로 격리증거금에 넣는 보충분입니다. 크기의 한계는 Arcus 증거금(RWA + Entropy 헤지를 같이 받침).
+#   3일마다 리밸런싱 전제. 백테스트(45일): Entropy OI 평균 $25.7k, 손익 +$104, 청산가 최근접 6.9%, Arcus 증거금 비율 최저 2.76
 # paper 모드에서는 이 금액이 모의 잔고입니다.
 capital:
-  arcus: 7750          # USDG  (RWA 1,750 + io 헤지 6,000)
-  hl:xyz: 1750         # USDC  trade.xyz 증거금 계정 (RWA 헤지 전용)
-  hl:io: 4500          # USDC  Entropy 증거금 계정. 전액을 격리 증거금으로 사용
+  arcus: 8000          # USDG  (RWA 약 2,000 + io 헤지 약 6,000)
+  hl:xyz: 2000         # USDC  trade.xyz 증거금 계정 (RWA 헤지 전용)
+  hl:io: 8000          # USDC  Entropy 증거금 계정. 격리 증거금 + 자동 보충분
 
 arcus:
   account_index: 0     # 봇 전용 서브계정을 권장합니다 (API 키 발급 시 Subaccount # 선택)
@@ -35,7 +35,7 @@ hyperliquid:
 # 페어별로 min_hold_h / max_hold_h / rotation_fraction_min / rotation_fraction_max / rotate_when 을 덮어쓸 수 있고,
 # rotate: false 면 회전 없이 보유만 합니다.
 pairs:
-  # ---------------- RWA 작업 (25%): Arcus <-> trade.xyz ----------------
+  # ---------------- RWA 작업 (약 22%): Arcus <-> trade.xyz ----------------
   - name: NVDA
     group: rwa
     maker: {venue: arcus, symbol: NVDA-USD}
@@ -52,7 +52,7 @@ pairs:
     leverage: 3
     direction: auto
 
-  # ---------------- io 작업 (75%): Arcus <-> Entropy, 주력 ----------------
+  # ---------------- io 작업 (약 78%): Arcus <-> Entropy, 주력. 합계 $27k ----------------
   # Arcus 와 Entropy 에 모두 있는 종목은 SNDK / DRAM / NBIS 뿐입니다.
   # 24~48시간마다 30~60% 회전(보유 위주). 거래량을 더 원하면 min_hold_h 8 / max_hold_h 16, 보유만 하려면 rotate: false.
   # Entropy 5배 격리: 약 17% 움직이면 청산이라, 청산가 8% 이내면 여유 잔고로 자동 보충하고
@@ -61,7 +61,7 @@ pairs:
     group: io
     maker: {venue: arcus, symbol: SNDK-USD}
     hedge: {venue: "hl:io", symbol: "io:SNDK"}
-    notional_usd: 14000
+    notional_usd: 16800
     leverage: 5
     direction: auto
     min_hold_h: 24
@@ -73,7 +73,7 @@ pairs:
     group: io
     maker: {venue: arcus, symbol: DRAM-USD}
     hedge: {venue: "hl:io", symbol: "io:DRAM"}
-    notional_usd: 4250
+    notional_usd: 5100
     leverage: 5
     direction: auto
     min_hold_h: 24
@@ -85,7 +85,7 @@ pairs:
     group: io
     maker: {venue: arcus, symbol: NBIS-USD}
     hedge: {venue: "hl:io", symbol: "io:NBIS"}
-    notional_usd: 4250
+    notional_usd: 5100
     leverage: 5
     direction: auto
     min_hold_h: 24
@@ -160,7 +160,7 @@ paper:
   state_dir: data/paper
 
 # 정기 리밸런싱 알림 (돈은 직접 옮기세요. 봇 키는 출금 권한이 없습니다)
-# every_h 마다 venues 의 잔고를 합쳐 capital 비율(Arcus 7750 : Entropy 4500)로 다시 나눈 이체 금액을 알려 줍니다.
+# every_h 마다 venues 의 잔고를 합쳐 capital 비율(Arcus 8000 : Entropy 8000 = 1:1)로 다시 나눈 이체 금액을 알려 줍니다.
 # RWA 쪽(trade.xyz)은 제외. `hedgebot rebalance` 로 언제든 확인 가능.
 rebalance:
   enabled: true
