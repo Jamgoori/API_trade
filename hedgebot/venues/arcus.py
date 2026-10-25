@@ -32,7 +32,8 @@ BASE_URLS = {
     "testnet": "https://api.testnet.arcus.xyz",
 }
 
-OP_PLACE, OP_CANCEL = 1, 2
+OP_PLACE, OP_CANCEL, OP_PLACE_UNTRIGGERED = 1, 2, 4
+STOP_SLIPPAGE_BOUND = Decimal("0.05")  # market stop fills within 5% of the trigger (Arcus allows up to 10%)
 SIDE_CODE = {Side.BUY: 0, Side.SELL: 1}
 TIF_CODE = {Tif.GTT: 0, Tif.IOC: 2, Tif.ALO: 3}
 GOOD_TIL_DAYS = 40  # Arcus requires goodTilTime >= 1 month ahead, even for IOC
@@ -446,6 +447,60 @@ class ArcusVenue(Venue):
         resp = self._legacy_post("/v1/setLeverage", "setLeverage", body, weight=125)
         if isinstance(resp, dict) and resp.get("status") == "REJECTED":
             raise VenueError(f"arcus setLeverage {symbol}: {resp.get('rejectReason')}", payload=resp)
+
+    def place_stop(self, symbol: str, side: Side, size: Decimal, trigger: Decimal) -> OrderState:
+        """Position-level stop-loss (positionTpsl): closes the whole position at trigger time."""
+        signer = self._require_signer()
+        info = self.market(symbol)
+        trigger = self.round_price(symbol, D(trigger), "nearest")
+        bound = trigger * (1 - STOP_SLIPPAGE_BOUND) if side is Side.SELL else trigger * (1 + STOP_SLIPPAGE_BOUND)
+        price = self.round_price(symbol, bound, "down" if side is Side.SELL else "up")
+        client_id = new_client_id("bs")
+        good_til_us = (time.time_ns() // 1000) + GOOD_TIL_DAYS * 86_400 * 1_000_000
+        ts = self._ts_ns()
+        payload = signer.order_payload(
+            op=OP_PLACE_UNTRIGGERED, market_id=int(info.extra["marketId"]), ct=ts, g_ns=good_til_us * 1000,
+            p=exact_units(price, D(info.extra["tickSize"])), q=0, reduce_only=True, side=side, tif=Tif.IOC,
+            client_id=client_id,
+        )
+        signature = signer.sign(payload.encode())
+        element = {
+            "address": signer.address,
+            "accountIndex": signer.account_index,
+            "marketId": int(info.extra["marketId"]),
+            "orderSide": side.value,
+            "orderType": "MARKET",
+            "quantity": "0",
+            "price": fmt_decimal(price),
+            "timeInForce": "IOC",
+            "goodTilTime": str(good_til_us),
+            "timestamp": ts,
+            "reduceOnly": True,
+            "stopPrice": fmt_decimal(trigger),
+            "tpslType": "STOP_LOSS",
+            "isPositionTPSL": True,
+            "clientId": client_id,
+            "signature": signature,
+        }
+        state = OrderState("", symbol, side, price, D(size), Tif.IOC, OrderStatus.PENDING, client_id=client_id,
+                           reduce_only=True, created_ts=time.time(), trigger_price=trigger)
+        try:
+            resp = self._signed_post("/v1/batchPlaceOrders", canonical_json({"grouping": "positionTpsl",
+                                                                              "orders": [element]}),
+                                     ts, signature, f"positionTpsl {symbol}")
+        except VenueError as exc:
+            if exc.status and 400 <= exc.status < 500 and exc.status != 429:
+                state.status, state.reject_reason = OrderStatus.REJECTED, str(exc.payload)
+                return state
+            raise
+        row = (resp.get("responses") or [{}])[0]
+        state.order_id = str(row.get("orderId", ""))
+        if row.get("status") in ("ERROR", "REJECTED") or row.get("error"):
+            state.status = OrderStatus.REJECTED
+            state.reject_reason = str(row.get("error") or row.get("rejectionReason"))
+        else:
+            state.status = OrderStatus.OPEN
+        return state
 
     def heartbeat(self, lead_s: int = 60) -> None:
         """Arm/refresh the dead man's switch so resting maker orders die with the bot."""

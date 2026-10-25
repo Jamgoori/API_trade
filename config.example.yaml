@@ -96,6 +96,12 @@ risk:
   isolated_liq_buffer_warn_pct: 8   # 격리 포지션(Entropy) 청산가까지 거리
   isolated_liq_buffer_critical_pct: 4
   derisk_fraction: 0.3
+  # 거래소에 걸어 두는 손절 (봇이 꺼져 있어도 거래소가 실행). 순서: 봇 축소 -> 거래소 손절 -> 청산
+  backstop_enabled: true
+  backstop_margin_ratio: 1.25        # 교차증거금 계정이 이 비율까지 떨어지는 가격에 손절
+  backstop_isolated_buffer_pct: 2    # 격리 포지션은 청산가 2% 앞에 손절
+  backstop_refresh_s: 60
+  stop_cooldown_h: 6                 # 손절/청산으로 한쪽이 닫히면 반대쪽도 정리 후 6시간 쉬고 재진입 (0 = 재진입 안 함)
   max_account_leverage: 5           # 거래소 계정 전체 명목가 / 자산 상한
   max_daily_loss_pct: 2             # 하루 손실이 전체 자산의 2% 넘으면 신규 진입/회전 중단
   stale_data_s: 20

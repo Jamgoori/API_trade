@@ -75,6 +75,10 @@ class BacktestParams:
     passive_miss_adverse_bps: float = 1.5
     urgent_slippage_bps: float = 10.0
     allow_transfers: bool = True
+    backstop_enabled: bool = True
+    backstop_margin_ratio: float = 1.25
+    backstop_isolated_buffer_pct: float = 2.0
+    stop_cooldown_h: float = 6
     points_per_musd: float = 33
     seed: int = 7
     label: str = ""
@@ -92,6 +96,7 @@ class PairResult:
     rotations: int = 0
     flips: int = 0
     derisks: int = 0
+    stops: int = 0
     liquidations: int = 0
     oi_hours: float = 0.0
     final_qty: float = 0.0
@@ -169,6 +174,10 @@ class BacktestResult:
     @property
     def derisks(self) -> int:
         return sum(p.derisks for p in self.pairs.values())
+
+    @property
+    def stops(self) -> int:
+        return sum(p.stops for p in self.pairs.values())
 
     @property
     def rotations(self) -> int:
@@ -344,13 +353,15 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
         p.next_rot = t + int(rng.uniform(params.min_hold_h, params.max_hold_h) * HOUR_MS)
         p.res.derisks += 1
 
-    def liquidate(p: "_Pair", maker_leg: bool, extreme: float, i: int, t: int) -> None:
-        """The exchange liquidates one leg at the bar extreme; the bot closes the other at the close."""
+    def liquidate(p: "_Pair", maker_leg: bool, extreme: float, i: int, t: int, stop: bool = False) -> None:
+        """One leg is closed by the venue at the bar extreme (liquidation, or our exchange stop when
+        `stop`: no liquidation penalty, just a market fill); the bot closes the other leg at the close."""
         (_, _, mc), (_, _, hc) = p.bar(i)
         spec, venue = (p.ms, p.mv) if maker_leg else (p.hs, p.hv)
         size = p.qty if maker_leg else -p.qty * p.ratio
         close = mc if maker_leg else hc
-        equity[venue] += size * (extreme - close) - abs(size) * extreme * spec.liquidation_fee
+        penalty = (params.urgent_slippage_bps / 1e4 + spec.taker_fee) if stop else spec.liquidation_fee
+        equity[venue] += size * (extreme - close) - abs(size) * extreme * penalty
         other_spec, other_venue = (p.hs, p.hv) if maker_leg else (p.ms, p.mv)
         other_size = -p.qty * p.ratio if maker_leg else p.qty
         other_close = hc if maker_leg else mc
@@ -361,8 +372,11 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
         p.qty = 0.0
         p.phase = "build"
         p.direction = 0
-        p.derisk_until = t + 6 * HOUR_MS
-        p.res.liquidations += 1
+        p.derisk_until = t + int((params.stop_cooldown_h if stop else 6) * HOUR_MS)
+        if stop:
+            p.res.stops += 1
+        else:
+            p.res.liquidations += 1
 
     last_day = None
     for i, t in enumerate(timeline):
@@ -408,7 +422,10 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
                 lev = leg_lev(p, spec, venue, False)
                 adverse = (entry - extreme) / entry if size > 0 else (extreme - entry) / entry
                 buffer = 1 / lev - spec.mmf
-                if adverse >= buffer:
+                stop_at = buffer - params.backstop_isolated_buffer_pct / 100
+                if params.backstop_enabled and adverse >= stop_at:
+                    liquidate(p, maker_leg, extreme, i, t, stop=True)
+                elif adverse >= buffer:
                     liquidate(p, maker_leg, extreme, i, t)
                 elif (buffer - adverse) * 100 < params.isolated_liq_buffer_critical_pct and t >= p.derisk_until:
                     derisk(p, i, t)
@@ -429,12 +446,13 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
                 continue
             ratio = worst_eq / worst_maint
             min_ratio[v] = min(min_ratio[v], ratio)
-            if ratio < 1.0:
+            stop_hit = params.backstop_enabled and ratio < params.backstop_margin_ratio
+            if ratio < 1.0 or stop_hit:
                 for p, size, spec, is_maker in legs:
                     (mh, ml, _), (hh, hl, _) = p.bar(i)
                     hi_, lo_ = (mh, ml) if is_maker else (hh, hl)
                     if p.qty:
-                        liquidate(p, is_maker, lo_ if size > 0 else hi_, i, t)
+                        liquidate(p, is_maker, lo_ if size > 0 else hi_, i, t, stop=stop_hit)
             elif ratio < params.margin_ratio_critical:
                 for p, _, _, _ in legs:
                     if p.qty and t >= p.derisk_until:

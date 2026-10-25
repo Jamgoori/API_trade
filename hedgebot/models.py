@@ -125,6 +125,7 @@ class OrderState:
     reject_reason: str | None = None
     fee: Decimal | None = None  # actual fee when the venue reports it
     created_ts: float = 0.0
+    trigger_price: Decimal | None = None  # set on resting stop orders
 
     @property
     def remaining(self) -> Decimal:

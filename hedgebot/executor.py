@@ -690,6 +690,7 @@ class PairExecutor:
             venue, symbol, pos = self.hedge, self.pair.hedge.symbol, snap.hedge_pos
             qty = min(abs(net) * self.ratio, abs(pos))
         side = Side.SELL if pos > 0 else Side.BUY
+        leg_lost = snap.maker_pos == 0 or snap.hedge_pos == 0
         self.ctx.event("warning", "imbalance",
                        f"{self.name}: legs off by {net} (${net_usd:.0f}); {side.value} {qty} on {venue.name}",
                        pair=self.name, venue=venue.name, notify=True)
@@ -697,7 +698,28 @@ class PairExecutor:
         self.flatten_leg(venue, symbol, side, qty, "repair", snap.maker_mkt.outside_rth)
         self.imbalance_since = None
         self.settle_until = now + SETTLE_S
+        if leg_lost:
+            self._after_external_close(now)
         return True
+
+    def _after_external_close(self, now: float) -> None:
+        """A whole leg vanished (exchange stop, liquidation, or a hedge interrupted by a crash).
+
+        The other leg has just been closed by the repair. Stay flat for the cool-off, then rebuild
+        from scratch (direction re-decided) only if both venues have the margin for it.
+        """
+        cool_h = self.cfg.risk.stop_cooldown_h
+        self.rt.direction = 0
+        self.rt.phase = Phase.BUILD.value
+        self.rt.target_qty = "0"
+        self.rt.flip_pending = False
+        self.rt.derisk_until = now + (cool_h * 3600 if cool_h > 0 else 10 * 365 * 86400)
+        self.persist()
+        wait = f"rebuilds after {cool_h:g}h if margin allows" if cool_h > 0 else "stays flat until you restart it"
+        self.ctx.event("critical", "leg_lost",
+                       f"{self.name}: one leg was closed outside the bot (exchange stop / liquidation / interrupted "
+                       f"hedge). Closed the other leg too; the pair {wait}. Check venue balances.",
+                       pair=self.name, notify=True)
 
     # --------------------------------------------------------------- shutdown
     def shutdown(self, timeout_s: float = 20) -> None:

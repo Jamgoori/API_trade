@@ -97,6 +97,16 @@ class RiskConfig:
     isolated_liq_buffer_warn_pct: Decimal = Decimal(8)
     isolated_liq_buffer_critical_pct: Decimal = Decimal(4)
     derisk_fraction: Decimal = Decimal("0.3")
+    # Exchange-side stop orders (work while the bot is down). They sit behind the bot's own de-risk
+    # thresholds and in front of liquidation: cross accounts at this margin ratio, isolated positions
+    # this far (% of price) from their liquidation price.
+    backstop_enabled: bool = True
+    backstop_margin_ratio: Decimal = Decimal("1.25")
+    backstop_isolated_buffer_pct: Decimal = Decimal(2)
+    backstop_refresh_s: float = 60
+    # After a leg is closed outside the bot (stop, liquidation): stay flat this long, then rebuild
+    # only if margin allows. 0 = never rebuild automatically.
+    stop_cooldown_h: float = 6
     max_account_leverage: Decimal = Decimal(5)
     max_daily_loss_pct: Decimal = Decimal(2)
     stale_data_s: float = 20
@@ -269,6 +279,10 @@ def validate(cfg: Config) -> None:
     r = cfg.risk
     if not (1 < r.margin_ratio_critical < r.margin_ratio_warn):
         raise ConfigError("risk: need 1 < margin_ratio_critical < margin_ratio_warn")
+    if not (1 < r.backstop_margin_ratio < r.margin_ratio_critical):
+        raise ConfigError("risk: need 1 < backstop_margin_ratio < margin_ratio_critical")
+    if not (0 < r.backstop_isolated_buffer_pct < r.isolated_liq_buffer_critical_pct):
+        raise ConfigError("risk: need 0 < backstop_isolated_buffer_pct < isolated_liq_buffer_critical_pct")
     if not cfg.execution.hedge_slippage_bps:
         raise ConfigError("execution.hedge_slippage_bps needs at least one step")
     if cfg.execution.hedge_mode not in ("taker", "passive_first"):

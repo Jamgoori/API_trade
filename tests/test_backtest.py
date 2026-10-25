@@ -85,8 +85,13 @@ def test_gap_against_thin_hedge_account_triggers_risk_events():
     d = make(n=100, maker_px=jump, hedge_px=jump, notional=12000, direction="long_maker")
     res = run_backtest([d], params(capital={"arcus": 5000.0, "hl:xyz": 3000.0}, allow_transfers=False,
                                    min_hold_h=1e6, max_hold_h=1e6), d.maker.t[0], d.maker.t[-1])
-    assert res.liquidations + res.derisks >= 1
+    assert res.stops >= 1 and res.liquidations == 0  # the exchange stop closes it before liquidation
     assert res.min_margin_ratio["hl:xyz"] < 1.7
+    no_stop = run_backtest([d], params(capital={"arcus": 5000.0, "hl:xyz": 3000.0}, allow_transfers=False,
+                                       min_hold_h=1e6, max_hold_h=1e6, backstop_enabled=False),
+                           d.maker.t[0], d.maker.t[-1])
+    assert no_stop.liquidations >= 1
+    assert res.net_pnl > no_stop.net_pnl  # a stop fill is cheaper than the liquidation penalty
 
 
 def test_transfers_rebalance_venues_on_slow_drift():

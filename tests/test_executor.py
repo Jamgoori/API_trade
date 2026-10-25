@@ -219,3 +219,20 @@ def test_passive_hedge_escalates_on_adverse_move(setup_pair):
         ex.step(now + k)
     assert positions(venues) == (10, -10)
     assert any(f["purpose"] == "hedge" and f["liquidity"] == "taker" for f in ctx.fills)
+
+
+def test_lost_leg_closes_the_other_and_cools_off(setup_pair):
+    """An exchange stop / liquidation closed the hedge leg while the bot was away."""
+    cfg, ctx, venues, arcus, hl = setup_pair()
+    from hedgebot.models import Side, Tif
+    venues["arcus"].place_order("TST-USD", Side.BUY, Dd(30), Dd("100.02"), Tif.IOC)
+    ex = PairExecutor(cfg.pairs[0], ctx, random.Random(1))
+    ex.rt.direction, ex.rt.phase, ex.rt.target_qty = 1, Phase.HOLD.value, "30"
+    ex.rt.next_rotation_ts = time.time() + 3600
+    now = time.time()
+    run_steps(ex, 4, start=now)
+    assert positions(venues) == (0, 0)
+    assert "leg_lost" in ctx.kinds()
+    assert ex.rt.derisk_until > now + 5 * 3600
+    run_steps(ex, 10, start=now + 60)  # no rebuild during the cool-off
+    assert positions(venues) == (0, 0) and ex.clip is None

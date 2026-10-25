@@ -28,6 +28,13 @@ Arcus  NVDA-USD  메이커(ALO, 수수료 0%)  ──체결──▶  Hyperliqui
 
 - **불균형 자동 수리**: 두 다리 수량 차이가 $40 이상이면 8초 확인 후 큰 쪽을 줄여서 맞춤(reduce-only)
 - **헤지 실패 시**: IOC를 5/15/40bp로 넓혀도 안 되면 Arcus 쪽을 즉시 되돌림. 한쪽만 들고 있지 않음
+- **거래소 손절(봇이 꺼져 있어도 작동)**: 각 다리에 reduce-only 손절 주문을 거래소에 걸어 둠.
+  순서는 `봇 축소(증거금 비율 1.7) → 거래소 손절(1.25 / 격리는 청산가 2% 앞) → 청산`.
+  Arcus는 포지션 전체 손절(positionTpsl), Hyperliquid는 트리거 주문이며 포지션이 바뀌면 봇이 다시 겁니다.
+  잔고가 충분해서 청산이 불가능한 다리(예: 100% 넘게 빠져야 청산)에는 걸지 않습니다.
+- **한쪽이 닫힌 뒤**: 손절·청산으로 한쪽 다리가 사라지면 봇이 반대쪽도 바로 정리해서 맨 포지션을 남기지 않고,
+  6시간(`stop_cooldown_h`) 쉰 뒤 방향을 새로 정해 증거금이 허락하는 만큼만 다시 쌓습니다. 봇이 꺼져 있던 동안
+  손절이 났다면 다시 켜는 즉시 같은 처리를 합니다.
 - **Arcus 데드맨 스위치**: 봇이 죽으면 60초 뒤 Arcus 미체결 주문 자동 취소
 - **장외시간 규칙 반영**: Arcus 장외 초기증거금 상향(신규 진입 레버리지 한도), 가격 밴드, 04:00·20:00 ET 경계 전후 3분 진입 금지
 - **일일 비용 예산**($20) 초과 시 회전 중단, **일일 손실 2%** 초과 시 신규 진입 중단(헤지 포지션은 유지)
@@ -76,7 +83,7 @@ python3 -m venv .venv && . .venv/bin/activate      # Python 3.11 이상
 pip install -e ".[dev]"
 cp config.example.yaml config.yaml                   # 금액·종목 수정
 cp .env.example .env                                 # testnet/live 때만 키 입력
-pytest -q                                            # 59개 테스트
+pytest -q                                            # 65개 테스트
 ```
 
 ## 4. 사용 순서
@@ -155,6 +162,9 @@ hedgebot flatten --mode live --confirm --i-understand-live   # 모든 봇 포지
 | `execution.hedge_mode` | passive_first | `taker`로 바꾸면 즉시 테이커 헤지 |
 | `risk.margin_ratio_warn / critical` | 3.0 / 1.7 | 자산÷유지증거금. 경고(입금 안내) / 자동 30% 축소 |
 | `risk.max_daily_loss_pct` | 2 | 초과 시 신규 진입·회전 중단 |
+| `risk.backstop_margin_ratio` | 1.25 | 거래소 손절 위치 (교차증거금 계정 기준) |
+| `risk.backstop_isolated_buffer_pct` | 2 | 격리 포지션 손절: 청산가 몇 % 앞 |
+| `risk.stop_cooldown_h` | 6 | 한쪽이 닫힌 뒤 재진입까지 대기. 0이면 자동 재진입 안 함 |
 
 ---
 
@@ -177,9 +187,10 @@ hedgebot/
   venues/paper.py        실시세 기반 모의 체결 (수수료·펀딩·증거금·청산 시뮬레이션)
   executor.py            페어 상태 머신: BUILD → HOLD → UNWIND, 메이커 클립 + 헤지 + 불균형 수리
   risk.py                계정 증거금 비율, 격리 청산 거리, 일일 손실 한도
+  backstop.py            거래소에 걸어 두는 손절 주문 관리
   strategy.py            방향·회전·베이시스·사이징 규칙 (실거래와 백테스트가 공유)
   engine.py              메인 루프, 데드맨 스위치, 스냅샷, 수수료 대조
   backtest/              과거 캔들·펀딩 재생 시뮬레이터
   scanner.py, report.py, journal.py, cli.py
-tests/                   59개 (서명, 체결, 헤지 실패, 불균형, 회전, 리스크, 백테스트)
+tests/                   65개 (서명, 체결, 헤지 실패, 불균형, 회전, 리스크, 거래소 손절, 백테스트)
 ```

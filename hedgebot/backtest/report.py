@@ -42,17 +42,18 @@ def format_result(res: BacktestResult) -> str:
         f"    cost per point         " + (f"${res.cost_per_point:,.2f}" if res.cost_per_point is not None else "n/a")
         + ("  (net positive: farming paid for itself)" if res.cost_per_point is not None and res.cost_per_point < 0 else ""),
         f"    rotations / flips      {res.rotations} / {sum(r.flips for r in res.pairs.values())}",
-        f"    de-risk / liquidations {res.derisks} / {res.liquidations}",
+        f"    de-risk / stops / liq  {res.derisks} / {res.stops} / {res.liquidations}",
         f"    min margin ratio       " + ", ".join(f"{v} {r:.2f}" for v, r in res.min_margin_ratio.items()),
         f"    venue transfers needed {res.transfers}  (${res.transfer_usd:,.0f} moved)",
         "",
         "  Per pair",
-        f"    {'pair':<14}{'maker vol':>12}{'off-hrs':>8}{'fees':>9}{'slip':>9}{'funding':>10}{'rot':>5}{'derisk':>7}{'liq':>4}",
+        f"    {'pair':<14}{'maker vol':>12}{'off-hrs':>8}{'fees':>9}{'slip':>9}{'funding':>10}{'rot':>5}{'derisk':>7}"
+        f"{'stop':>5}{'liq':>4}",
     ]
     for r in res.pairs.values():
         share = r.maker_volume_off_hours / r.maker_volume if r.maker_volume else 0
         lines.append(f"    {r.name:<14}{r.maker_volume:>12,.0f}{share:>8.0%}{r.fees:>9,.2f}{r.slippage:>9,.2f}"
-                     f"{r.funding:>10,.2f}{r.rotations:>5}{r.derisks:>7}{r.liquidations:>4}")
+                     f"{r.funding:>10,.2f}{r.rotations:>5}{r.derisks:>7}{r.stops:>5}{r.liquidations:>4}")
     lines.append("")
     lines.append("  Equity by venue (end of day, UTC)")
     venues = list(res.start_equity)
@@ -65,12 +66,12 @@ def format_result(res: BacktestResult) -> str:
 
 def format_sweep(results: list[BacktestResult]) -> str:
     header = (f"{'variant':<28}{'net PnL':>11}{'$/day':>9}{'vol/day':>11}{'pts/wk':>8}{'$/pt':>8}"
-              f"{'derisk':>7}{'liq':>4}{'xfer':>5}{'min MR':>8}")
+              f"{'derisk':>7}{'stop':>5}{'liq':>4}{'xfer':>5}{'min MR':>8}")
     lines = [header, "-" * len(header)]
     for r in results:
         cpp = f"{r.cost_per_point:,.2f}" if r.cost_per_point is not None else "n/a"
         mr = min((x for x in r.min_margin_ratio.values() if x == x), default=float("nan"))
         lines.append(f"{r.params.label:<28}{r.net_pnl:>11,.0f}{r.net_pnl / r.days:>9,.1f}"
                      f"{r.maker_volume / r.days:>11,.0f}{r.est_points / r.days * 7:>8,.1f}{cpp:>8}"
-                     f"{r.derisks:>7}{r.liquidations:>4}{r.transfers:>5}{mr:>8.2f}")
+                     f"{r.derisks:>7}{r.stops:>5}{r.liquidations:>4}{r.transfers:>5}{mr:>8.2f}")
     return "\n".join(lines)

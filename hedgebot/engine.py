@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
+from .backstop import BackstopManager
 from .config import Config, Secrets
 from .executor import PairExecutor
 from .journal import Journal
@@ -82,6 +83,7 @@ class Engine:
             self.venues = market_venues
         self.risk = RiskManager(cfg, self)
         self.executors: list[PairExecutor] = []
+        self.backstops = BackstopManager(self) if cfg.risk.backstop_enabled else None
 
     # ------------------------------------------------------------ context API
     def account(self, venue: str, max_age_s: float = 5.0) -> AccountState:
@@ -261,6 +263,8 @@ class Engine:
             st = ex.status()
             parts.append(f"{ex.name}: {st['phase']}{'*' if st['busy'] else ''} dir {st['direction']:+d} "
                          f"rot {st['rotations']}")
+        if self.backstops:
+            parts.append(f"stops {len(self.backstops.active)}")
         log.info("status | %s%s", " | ".join(parts), " | HALTED" if self.halted else "")
 
     def tick(self) -> None:
@@ -279,6 +283,8 @@ class Engine:
             self.event("warning", "risk", f"risk check failed: {exc}", throttle_key="riskerr", throttle_s=600)
         for ex in self.executors:
             ex.step()
+        if self.backstops and self._due("backstop", cfg.risk.backstop_refresh_s):
+            self.backstops.refresh()
         if self._due("snapshot", cfg.poll.snapshot_s):
             for name in self.venues:
                 try:
@@ -335,6 +341,8 @@ def flatten_all(engine: Engine) -> None:
         ex.rt.phase = "build"
         ex.rt.target_qty = "0"
         ex.persist()
+    if engine.backstops:
+        engine.backstops.cancel_all()
 
 
 def ensure_dirs(cfg: Config) -> None:

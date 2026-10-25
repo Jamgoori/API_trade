@@ -143,3 +143,25 @@ def test_isolated_liquidation_price_long_and_short():
     # short 1 @100 with $20 margin: 20 - (P-100) = 0.05P -> P = 114.29
     assert isolated_liquidation_price(Decimal(-1), Decimal(100), Decimal(20), Decimal("0.05")).quantize(Decimal("0.01")) \
         == Decimal("114.29")
+
+
+def test_position_stop_uses_untriggered_op_and_position_grouping():
+    signer = ArcusSigner(PRIV, ADDR)
+    v = _venue_with_market(signer)
+    v.http = CaptureHttp(Resp(202, {"responses": [{"orderId": "bb01", "status": "ACK", "clientTime": 1,
+                                                    "marketId": 28, "marketDisplayName": "NVDA-USD"}]}))
+    st = v.place_stop("NVDA-USD", Side.SELL, Decimal("5"), Decimal("180.004"))
+    assert st.status is OrderStatus.OPEN and st.order_id == "bb01" and st.trigger_price == Decimal("180.00")
+    _, path, kw = v.http.calls[0]
+    assert path == "/v1/batchPlaceOrders"
+    body = json.loads(kw["data"])
+    assert body["grouping"] == "positionTpsl"
+    (o,) = body["orders"]
+    assert (o["tpslType"], o["orderType"], o["timeInForce"], o["quantity"], o["reduceOnly"]) == \
+        ("STOP_LOSS", "MARKET", "IOC", "0", True)
+    assert o["stopPrice"] == "180" and o["price"] == "171"  # 5% slippage bound below the trigger
+    payload = signer.order_payload(op=4, market_id=28, ct=o["timestamp"], g_ns=int(o["goodTilTime"]) * 1000,
+                                   p=17100, q=0, reduce_only=True, side=Side.SELL, tif=Tif.IOC,
+                                   client_id=o["clientId"])
+    verify(signer, payload.encode(), o["signature"])
+    assert kw["headers"]["X-Signature"] == o["signature"]

@@ -55,3 +55,17 @@ def test_resting_and_rejected():
     assert st.status is OrderStatus.REJECTED and "margin" in st.reject_reason
     v, _ = _venue({"status": "err", "response": "User or API Wallet does not exist."})
     assert v.place_order("xyz:NVDA", Side.BUY, Decimal("1"), Decimal("200"), Tif.IOC).status is OrderStatus.REJECTED
+
+
+def test_stop_is_reduce_only_market_trigger():
+    v, ex = _venue({"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 9}}]}}})
+    from hedgebot.models import MarketInfo
+    from tests.conftest import make_market
+    m = make_market("hl:xyz", "xyz:NVDA", step_size=Decimal("0.001"))
+    m.extra["szDecimals"] = 3
+    v._markets = {"xyz:NVDA": m}
+    st = v.place_stop("xyz:NVDA", Side.BUY, Decimal("2.5"), Decimal("250.004"))
+    assert st.status is OrderStatus.OPEN and st.order_id == "9"
+    (args, kw), = ex.calls
+    assert args[:4] == ("xyz:NVDA", True, 2.5, 275.0)
+    assert args[4] == {"trigger": {"triggerPx": 250.0, "isMarket": True, "tpsl": "sl"}} and kw["reduce_only"]

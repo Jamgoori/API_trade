@@ -165,6 +165,13 @@ class Venue(ABC):
     def set_leverage(self, symbol: str, leverage: int, cross: bool) -> None:
         raise VenueError(f"{self.name}: trading needs credentials")
 
+    def place_stop(self, symbol: str, side: Side, size: Decimal, trigger: Decimal) -> OrderState:
+        """Reduce-only stop-market that rests on the venue: the backstop when the bot is not running.
+
+        It is canceled with `cancel_order`. Venues may close the whole position regardless of `size`.
+        """
+        raise VenueError(f"{self.name}: stop orders need credentials")
+
     def heartbeat(self) -> None:
         """Refresh any server-side dead man's switch. No-op where none is used."""
 

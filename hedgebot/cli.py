@@ -146,6 +146,8 @@ def cmd_backtest(args) -> int:
         isolated_liq_buffer_critical_pct=float(r.isolated_liq_buffer_critical_pct),
         max_account_leverage=float(r.max_account_leverage),
         allow_transfers=not args.no_transfers,
+        backstop_enabled=r.backstop_enabled, backstop_margin_ratio=float(r.backstop_margin_ratio),
+        backstop_isolated_buffer_pct=float(r.backstop_isolated_buffer_pct), stop_cooldown_h=r.stop_cooldown_h,
         points_per_musd=args.points_per_musd or float(cfg.points.arcus_points_per_musd),
         seed=args.seed, label="config",
     )
@@ -164,6 +166,7 @@ def cmd_backtest(args) -> int:
         replace(base, label="no basis guard", use_basis_guard=False),
         replace(base, label="budget x3", max_daily_cost_usd=base.max_daily_cost_usd * 3),
         replace(base, label="no transfers", allow_transfers=False),
+        replace(base, label="no exchange stops", backstop_enabled=False),
         replace(base, label="taker hedge", passive_hedge_fill_rate=0.0) if base.passive_hedge_fill_rate else
         replace(base, label="passive hedge 50% fills", passive_hedge_fill_rate=0.5),
         replace(base, label="passive hedge 50% + 8-16h", passive_hedge_fill_rate=base.passive_hedge_fill_rate or 0.5,

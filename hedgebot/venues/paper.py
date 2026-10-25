@@ -55,6 +55,7 @@ class PaperVenue(Venue):
         self.cash = D(starting_equity)
         self.positions: dict[str, PaperPosition] = {}
         self.orders: dict[str, OrderState] = {}
+        self.stops: dict[str, OrderState] = {}
         self.leverage: dict[str, tuple[int, bool]] = {}
         self.fills: list[Fill] = []
         self.fees_paid = ZERO
@@ -204,6 +205,8 @@ class PaperVenue(Venue):
     def account(self) -> AccountState:
         self._apply_funding()
         marks = {s: self._mark(s) for s in self.positions}
+        self._check_stops(marks)
+        marks = {s: marks[s] for s in self.positions}
         self._check_liquidations(marks)
         marks = {s: marks[s] for s in self.positions}
         positions: dict[str, Position] = {}
@@ -320,6 +323,8 @@ class PaperVenue(Venue):
         self._save()
 
     def order_state(self, order: OrderState) -> OrderState:
+        if order.order_id in self.stops:
+            return self.stops[order.order_id]
         live = self.orders.get(order.order_id)
         if live is None:
             return order
@@ -340,9 +345,36 @@ class PaperVenue(Venue):
         return live
 
     def cancel_order(self, symbol: str, order_id: str) -> None:
-        order = self.orders.pop(order_id, None)
+        order = self.orders.pop(order_id, None) or self.stops.pop(order_id, None)
         if order:
             order.status = OrderStatus.CANCELED
+
+    def place_stop(self, symbol, side, size, trigger) -> OrderState:
+        order = self._new_order(symbol, side, D(size), D(trigger), Tif.IOC, True, None)
+        order.trigger_price = D(trigger)
+        current = self.positions.get(symbol)
+        if current is None or (current.size > 0) == (side is Side.BUY):
+            return self._reject(order, "NO_POSITION_TO_PROTECT")
+        self.stops[order.order_id] = order
+        return order
+
+    def _check_stops(self, marks: dict[str, Decimal]) -> None:
+        """Fire resting stops whose trigger the mark crossed: close the position with a market IOC."""
+        for order_id, stop in list(self.stops.items()):
+            pos = self.positions.get(stop.symbol)
+            if pos is None:
+                continue
+            mark = marks.get(stop.symbol) or self._mark(stop.symbol)
+            hit = mark <= stop.trigger_price if stop.side is Side.SELL else mark >= stop.trigger_price
+            if not hit:
+                continue
+            self.stops.pop(order_id)
+            size = min(abs(pos.size), stop.size) if stop.size > 0 else abs(pos.size)
+            far = Decimal("0.5") if stop.side is Side.SELL else Decimal("1.5")
+            fill = self._new_order(stop.symbol, stop.side, size, mark * far, Tif.IOC, True, None)
+            self._fill_ioc(fill)
+            stop.filled, stop.avg_price, stop.status = fill.filled, fill.avg_price, OrderStatus.FILLED
+            log.error("%s PAPER STOP fired %s %s %s at mark %s", self.name, stop.symbol, stop.side.value, size, mark)
 
     def cancel_all(self) -> None:
         for order_id in list(self.orders):

@@ -314,9 +314,32 @@ class HyperliquidVenue(Venue):
             raise VenueError(f"{self.name} cancel {order_id}: {exc}", retryable=True) from exc
 
     def cancel_all(self) -> None:
-        rows = self.client.info({"type": "openOrders", "user": self._user(), "dex": self.dex}, 20)
+        # frontendOpenOrders also lists untriggered stop orders
+        rows = self.client.info({"type": "frontendOpenOrders", "user": self._user(), "dex": self.dex}, 20)
         for o in rows:
             self.cancel_order(o["coin"], str(o["oid"]))
+
+    def place_stop(self, symbol: str, side: Side, size: Decimal, trigger: Decimal) -> OrderState:
+        """Reduce-only stop-market trigger order (sized; refreshed by the backstop manager)."""
+        trigger = self.round_price(symbol, D(trigger), "nearest")
+        bound = trigger * Decimal("0.9") if side is Side.SELL else trigger * Decimal("1.1")
+        limit = self.round_price(symbol, bound, "down" if side is Side.SELL else "up")
+        size = self.round_size(symbol, size)
+        state = OrderState("", symbol, side, limit, size, Tif.GTT, OrderStatus.PENDING, reduce_only=True,
+                           created_ts=time.time(), trigger_price=trigger)
+        try:
+            resp = self.client.exchange.order(
+                symbol, side is Side.BUY, float(size), float(limit),
+                {"trigger": {"triggerPx": float(trigger), "isMarket": True, "tpsl": "sl"}}, reduce_only=True,
+            )
+        except Exception as exc:
+            raise VenueError(f"{self.name} stop {symbol}: {exc}", retryable=True) from exc
+        status = resp["response"]["data"]["statuses"][0] if resp.get("status") == "ok" else {"error": resp}
+        if "resting" in status:
+            state.order_id, state.status = str(status["resting"]["oid"]), OrderStatus.OPEN
+        else:
+            state.status, state.reject_reason = OrderStatus.REJECTED, str(status.get("error", status))
+        return state
 
     def set_leverage(self, symbol: str, leverage: int, cross: bool) -> None:
         info = self.market(symbol)
