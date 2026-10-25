@@ -9,13 +9,14 @@ mode: paper            # paper(실시세 모의) | testnet | live
 # 자금 배분 (총 $14,000 예시)
 #   RWA 작업 25% ($3,500)  = Arcus $1,750 + trade.xyz $1,750   -> Arcus RWA 종목을 trade.xyz 로 헤지
 #   io 작업  75% ($10,500) = Entropy $4,500 + Arcus $6,000     -> Entropy 종목을 Arcus 로 헤지 (주력)
-#   Entropy 5배면 $20k 포지션의 증거금이 $4,000 이라 Entropy 에는 $4,500 만 두고, 나머지는 Arcus 쪽 여유로 둡니다.
-#   3일마다 리밸런싱 전제. 백테스트(45일): Entropy OI $18.9k, 거래량 $22k/일, 손익 거의 0, 청산가 최근접 6.8%
+#   Entropy 는 증거금을 놀리지 않게 전액 투입: $4,500 x 5배 = $22.5k 목표 (실제로는 증거금 한도까지 약 $20~21k 유지).
+#   Arcus 쪽 여유 증거금은 놀고 있는 돈이 아니라 교차증거금 쿠션입니다(헤지 다리가 청산되지 않게 받쳐 줌).
+#   3일마다 리밸런싱 전제. 백테스트(45일): Entropy OI 평균 $20.5k, 손익 +$65, 청산가 최근접 5.5%, Arcus 증거금 비율 최저 2.95
 # paper 모드에서는 이 금액이 모의 잔고입니다.
 capital:
   arcus: 7750          # USDG  (RWA 1,750 + io 헤지 6,000)
   hl:xyz: 1750         # USDC  trade.xyz 증거금 계정 (RWA 헤지 전용)
-  hl:io: 4500          # USDC  Entropy 증거금 계정. 격리 증거금 4,000 + 자동 보충용 여유 500
+  hl:io: 4500          # USDC  Entropy 증거금 계정. 전액을 격리 증거금으로 사용
 
 arcus:
   account_index: 0     # 봇 전용 서브계정을 권장합니다 (API 키 발급 시 Subaccount # 선택)
@@ -53,19 +54,18 @@ pairs:
 
   # ---------------- io 작업 (75%): Arcus <-> Entropy, 주력 ----------------
   # Arcus 와 Entropy 에 모두 있는 종목은 SNDK / DRAM / NBIS 뿐입니다.
-  # 8~16시간마다 30~60% 회전: Arcus 메이커 수수료 0% + Entropy 헤지 약 1bp 라 거래량을 싸게 만듭니다.
-  # 보유 위주로 돌리려면 min_hold_h 24 / max_hold_h 48, 보유만 하려면 rotate: false.
+  # 24~48시간마다 30~60% 회전(보유 위주). 거래량을 더 원하면 min_hold_h 8 / max_hold_h 16, 보유만 하려면 rotate: false.
   # Entropy 5배 격리: 약 17% 움직이면 청산이라, 청산가 8% 이내면 여유 잔고로 자동 보충하고
   # 3일마다 Arcus 이익을 Entropy 로 옮기는(rebalance) 것을 전제로 합니다.
   - name: SNDK-io
     group: io
     maker: {venue: arcus, symbol: SNDK-USD}
     hedge: {venue: "hl:io", symbol: "io:SNDK"}
-    notional_usd: 12500
+    notional_usd: 14000
     leverage: 5
     direction: auto
-    min_hold_h: 8
-    max_hold_h: 16
+    min_hold_h: 24
+    max_hold_h: 48
     rotation_fraction_min: 0.3
     rotation_fraction_max: 0.6
 
@@ -73,11 +73,11 @@ pairs:
     group: io
     maker: {venue: arcus, symbol: DRAM-USD}
     hedge: {venue: "hl:io", symbol: "io:DRAM"}
-    notional_usd: 3750
+    notional_usd: 4250
     leverage: 5
     direction: auto
-    min_hold_h: 8
-    max_hold_h: 16
+    min_hold_h: 24
+    max_hold_h: 48
     rotation_fraction_min: 0.3
     rotation_fraction_max: 0.6
 
@@ -85,11 +85,11 @@ pairs:
     group: io
     maker: {venue: arcus, symbol: NBIS-USD}
     hedge: {venue: "hl:io", symbol: "io:NBIS"}
-    notional_usd: 3750
+    notional_usd: 4250
     leverage: 5
     direction: auto
-    min_hold_h: 8
-    max_hold_h: 16
+    min_hold_h: 24
+    max_hold_h: 48
     rotation_fraction_min: 0.3
     rotation_fraction_max: 0.6
 
