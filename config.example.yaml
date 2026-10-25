@@ -8,12 +8,14 @@ mode: paper            # paper(실시세 모의) | testnet | live
 
 # 자금 배분 (총 $14,000 예시)
 #   RWA 작업 25% ($3,500)  = Arcus $1,750 + trade.xyz $1,750   -> Arcus RWA 종목을 trade.xyz 로 헤지
-#   io 작업  75% ($10,500) = Entropy $5,250 + Arcus $5,250     -> Entropy 종목을 Arcus 로 헤지, 포지션 유지 위주
+#   io 작업  75% ($10,500) = Entropy $4,000 + Arcus $6,500     -> Entropy 종목을 Arcus 로 헤지, 포지션 유지 위주
+#   Entropy 5배면 $16k 포지션의 증거금이 $3,200 이라 Entropy 에는 $4,000 만 두고, 나머지는 Arcus 쪽 여유로 둡니다.
+#   (백테스트상 이 배분이 Arcus 증거금 비율 4.2 로 가장 여유 있음. 3일마다 리밸런싱 전제)
 # paper 모드에서는 이 금액이 모의 잔고입니다.
 capital:
-  arcus: 7000          # USDG  (RWA 1,750 + io 헤지 5,250)
+  arcus: 8250          # USDG  (RWA 1,750 + io 헤지 6,500)
   hl:xyz: 1750         # USDC  trade.xyz 증거금 계정 (RWA 헤지 전용)
-  hl:io: 5250          # USDC  Entropy 증거금 계정. 격리 전용이라 증거금 4,000 + 자동 보충용 여유 1,250
+  hl:io: 4000          # USDC  Entropy 증거금 계정. 격리 증거금 3,200 + 자동 보충용 여유 800
 
 arcus:
   account_index: 0     # 봇 전용 서브계정을 권장합니다 (API 키 발급 시 Subaccount # 선택)
@@ -52,12 +54,14 @@ pairs:
   # ---------------- io 작업 (75%): Arcus <-> Entropy, 보유 위주 ----------------
   # Arcus 와 Entropy 에 모두 있는 종목은 SNDK / DRAM / NBIS 뿐입니다.
   # 하루~이틀마다 20~40% 만 회전해서 Entropy 30일 거래량을 유지합니다. 보유만 하려면 rotate: false.
+  # Entropy 5배 격리: 약 17% 움직이면 청산이라, 청산가 8% 이내면 여유 잔고로 자동 보충하고
+  # 3일마다 Arcus 이익을 Entropy 로 옮기는(rebalance) 것을 전제로 합니다.
   - name: SNDK-io
     group: io
     maker: {venue: arcus, symbol: SNDK-USD}
     hedge: {venue: "hl:io", symbol: "io:SNDK"}
-    notional_usd: 5000
-    leverage: 2        # Entropy 격리 2배: 청산까지 약 47%, 경고 시 여유 잔고로 자동 보충
+    notional_usd: 10000
+    leverage: 5
     direction: auto
     min_hold_h: 24
     max_hold_h: 48
@@ -68,8 +72,8 @@ pairs:
     group: io
     maker: {venue: arcus, symbol: DRAM-USD}
     hedge: {venue: "hl:io", symbol: "io:DRAM"}
-    notional_usd: 1500
-    leverage: 2
+    notional_usd: 3000
+    leverage: 5
     direction: auto
     min_hold_h: 24
     max_hold_h: 48
@@ -80,8 +84,8 @@ pairs:
     group: io
     maker: {venue: arcus, symbol: NBIS-USD}
     hedge: {venue: "hl:io", symbol: "io:NBIS"}
-    notional_usd: 1500
-    leverage: 2
+    notional_usd: 3000
+    leverage: 5
     direction: auto
     min_hold_h: 24
     max_hold_h: 48
@@ -155,7 +159,7 @@ paper:
   state_dir: data/paper
 
 # 정기 리밸런싱 알림 (돈은 직접 옮기세요. 봇 키는 출금 권한이 없습니다)
-# every_h 마다 venues 의 잔고를 합쳐 capital 비율(Arcus 7000 : Entropy 5250)로 다시 나눈 이체 금액을 알려 줍니다.
+# every_h 마다 venues 의 잔고를 합쳐 capital 비율(Arcus 8250 : Entropy 4000)로 다시 나눈 이체 금액을 알려 줍니다.
 # RWA 쪽(trade.xyz)은 제외. `hedgebot rebalance` 로 언제든 확인 가능.
 rebalance:
   enabled: true
