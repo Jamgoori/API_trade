@@ -1,12 +1,12 @@
 # hedgebot: Arcus ↔ Hyperliquid HIP-3 헤지 포인트 봇
 
 Arcus(Robinhood Chain)와 Hyperliquid HIP-3 거래소(trade.xyz = `hl:xyz`, Entropy = `hl:io`)에
-**같은 종목을 같은 수량, 반대 방향**으로 잡아서 가격 위험 없이 Arcus 포인트를 쌓고(자산 25%),
-Entropy 포지션과 거래량을 유지하는(자산 75%) 봇입니다.
+**같은 종목을 같은 수량, 반대 방향**으로 잡아서 가격 위험 없이 **Entropy 포지션·거래량(주력, 자산 75%)**과
+Arcus 포인트(자산 25%)를 쌓는 봇입니다.
 
 ```
 RWA 작업  Arcus NVDA·TSLA  메이커(수수료 0%)  ──체결──▶  trade.xyz  반대 방향 헤지
-io 작업   Arcus SNDK·DRAM·NBIS 메이커          ──체결──▶  Entropy    반대 방향 헤지 (보유 위주)
+io 작업   Arcus SNDK·DRAM·NBIS 메이커          ──체결──▶  Entropy    반대 방향 헤지 (주력)
           헤지: 메이커로 먼저 걸고, 20초 경과 또는 3bp 불리하면 테이커
 ```
 
@@ -21,7 +21,7 @@ io 작업   Arcus SNDK·DRAM·NBIS 메이커          ──체결──▶  Ent
 | 작업 | 비중 | 구성 | 목적 |
 |---|---|---|---|
 | **RWA 작업** | 25% ($3.5k) | Arcus NVDA·TSLA ↔ **trade.xyz** 헤지 (Arcus $1.75k + xyz $1.75k) | Arcus 포인트(거래량), 6~12시간마다 30~70% 회전 |
-| **io 작업** | 75% ($10.5k) | Entropy SNDK $10k·DRAM $3k·NBIS $3k (5배) ↔ **Arcus** 헤지 (Entropy $4k + Arcus $6.5k) | Entropy 포지션 유지(OI) 위주, 24~48시간마다 20~40%만 회전해 30일 거래량 유지. **3일마다 리밸런싱 전제** |
+| **io 작업 (주력)** | 75% ($10.5k) | Entropy SNDK $12.5k·DRAM $3.75k·NBIS $3.75k (5배, 합계 $20k) ↔ **Arcus** 헤지 (Entropy $4.5k + Arcus $6k) | Entropy OI + 거래량. 8~16시간마다 30~60% 회전. **3일마다 리밸런싱 전제** |
 
 - Arcus와 Entropy에 함께 있는 종목은 SNDK·DRAM·NBIS뿐입니다(ANTH·OAI 같은 프리 IPO는 Arcus에 없음).
 - 헤지된 페어는 양쪽 거래량이 같습니다. 그래서 Arcus를 메이커(수수료 0%)로 두고 Entropy를 헤지 쪽으로 둬도
@@ -60,10 +60,23 @@ io 작업   Arcus SNDK·DRAM·NBIS 메이커          ──체결──▶  Ent
 
 | 기간 | 순손익 | 펀딩 | 수수료+스프레드 | Arcus 거래량/일 (RWA / io) | Entropy 거래량/일 | 포인트/주* | 청산·손절 |
 |---|---|---|---|---|---|---|---|
-| 45일, 15분봉 | **+$78** | +$188 | -$122 | $13.6k ($7.7k / $5.8k) | $5.8k | 3.1 | 0 |
+| 45일, 15분봉 | **-$20** | +$232 | -$271 | $30.1k ($8.3k / $21.9k) | **$21.9k** | 7.0 | 0 |
 
-Entropy 평균 OI $15.0k, 자동 보충 7회($2.6k), 3일 리밸런싱 10회(평균 $635), 청산가에 가장 가까웠던 거리 5.6%,
-Arcus 최저 증거금 비율 4.2(경고 3.0).
+Entropy 평균 OI **$18.9k**, Entropy 30일 거래량 약 **$66만**, 자동 보충 2회($1.0k), 3일 리밸런싱 8회(평균 $790),
+청산가에 가장 가까웠던 거리 6.8%, Arcus 최저 증거금 비율 3.2(경고 3.0).
+
+Entropy 작업 크기·회전 비교 (Entropy 5배, 3일 리밸런싱, 45일):
+
+| Entropy 포지션 / 회전 | 순손익 | Entropy OI | Entropy 거래량/일 | 청산가 최근접 | Arcus 증거금 비율 |
+|---|---|---|---|---|---|
+| $16k / 24~48h | +$77 | $14.8k | $5.2k | 6.1% | 4.5 |
+| **$20k / 8~16h (기본)** | **-$20** | **$18.9k** | **$21.9k** | 6.8% | 3.2 |
+| $20k / 4~8h | -$156 | $18.1k | $38.3k | 7.2% | 3.6 |
+| $20k / 2~4h | -$275 | $17.9k | $54.7k | 6.8% | 3.5 |
+| $24k / 8~16h | +$15 | $21.0k | $22.0k | 5.8% | **2.8** (경고선 아래) |
+
+- Entropy 거래량은 싸게 만들어집니다(Arcus 메이커 0% + Entropy 헤지 약 1bp). 회전을 4~8시간으로 당기면 거래량이 2배 가까이 되고 비용은 하루 약 $3입니다.
+- 포지션 크기의 한계는 **Arcus 증거금**입니다. Arcus가 RWA와 Entropy 헤지를 같이 떠안아서, $24k부터는 Arcus 증거금 비율이 경고선 밑으로 내려갑니다.
 
 \* Arcus 포인트는 **가정치**입니다: 커뮤니티 공개 기록 기준 RWA 거래량 $100만당 약 33포인트.
 
@@ -184,9 +197,9 @@ hedgebot flatten --mode live --confirm --i-understand-live   # 모든 봇 포지
 
 | 키 | 기본값 | 설명 |
 |---|---|---|
-| `capital` | arcus 8250 / hl:xyz 1750 / hl:io 4000 | 거래소별 자금 (paper 잔고). RWA 25% / io 75% |
+| `capital` | arcus 7750 / hl:xyz 1750 / hl:io 4500 | 거래소별 자금 (paper 잔고). RWA 25% / io 75% |
 | `pairs[].notional_usd`, `leverage`, `direction` | | 페어별 명목가, 레버리지, `auto` / `long_maker` / `short_maker` |
-| `pairs[].rotate`, `min_hold_h`, `max_hold_h`, `rotation_fraction_min/max` | io: 24~48h, 20~40% | 페어별 회전 설정. `rotate: false`면 보유만 |
+| `pairs[].rotate`, `min_hold_h`, `max_hold_h`, `rotation_fraction_min/max` | io: 8~16h, 30~60% | 페어별 회전 설정. `rotate: false`면 보유만 |
 | `strategy.min_hold_h / max_hold_h` | 6 / 12 | 회전 간격. 짧을수록 포인트↑ 비용↑ |
 | `strategy.rotate_when` | off_hours | Arcus 장외시간(20:00~04:00 ET, 주말)에만 회전 |
 | `strategy.max_daily_cost_usd` | 20 | 하루 수수료+슬리피지 한도 |
