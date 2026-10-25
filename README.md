@@ -71,6 +71,27 @@ io 작업   Arcus SNDK·DRAM·NBIS 메이커          ──체결──▶  Ent
 - **거래소 간 잔고가 벌어집니다.** 45일 동안 Entropy 계정은 $5,250 → $3,374로 줄고 Arcus는 늘었습니다(합계는 그대로).
   보유 위주일수록 이 차이가 쌓이니 **한두 달에 한 번은 Arcus에서 Entropy로 옮겨 주세요.** 봇이 경고하고, 그 전까지는 자동 보충으로 버팁니다.
 
+### 3일마다 리밸런싱하면? (io 작업만, 45일 실데이터)
+
+Arcus ↔ Entropy 잔고를 3일마다 계획 비율로 되돌리는 경우를 Entropy 레버리지별로 비교했습니다(`--rebalance-every-h 72`).
+
+| Entropy 레버리지 (명목가) | 리밸런싱 | Entropy OI 평균 | Entropy 거래량/일 | 청산가에 가장 가까웠던 거리 | 자동 보충 | 이체 횟수 (평균 금액) |
+|---|---|---|---|---|---|---|
+| 2배 ($8k, 기본) | 없음 | $7.5k | $2.8k | 30.9% | 0 | 0 |
+| 2배 | 3일마다 | $7.7k | $3.1k | 30.9% | 0 | 8회 ($390) |
+| 4배 ($16k) | 없음 | $13.8k | $4.5k | 4.8% | 4 | 0 |
+| **4배** | **3일마다** | **$15.4k** | **$6.3k** | **7.8%** | 0 | 10회 ($580) |
+| 5배 ($20k) | 없음 | $16.3k | $5.7k | 0.6% (손절 1회) | 9 | 0 |
+| 5배 | 3일마다 | $18.9k | $7.2k | 5.5% | 7 | 9회 ($620) |
+
+- **2배에서는 리밸런싱이 필요 없습니다.** 청산까지 30% 넘게 여유가 남습니다.
+- 리밸런싱의 가치는 **같은 돈으로 Entropy 레버리지를 4배로 올릴 수 있게 해 주는 것**입니다. OI·거래량이 약 2배가 됩니다.
+- 3일 안에 오는 급변(SNDK 하루 ±13%)은 리밸런싱으로 못 막습니다. 그건 자동 보충과 거래소 손절이 맡습니다.
+- 4배면 Arcus 계정 증거금 비율이 3.4까지 내려갑니다(경고 3.0). 그래서 Arcus 쪽 여유도 함께 봐야 합니다.
+
+봇은 `rebalance` 설정에 따라 72시간마다 "Arcus → Entropy $X"처럼 금액을 알려 주고, `hedgebot rebalance`로 언제든 확인할 수 있습니다.
+RWA 쪽(trade.xyz)은 리밸런싱 대상에서 뺐습니다.
+
 백테스트가 알 수 없는 것: 메이커 주문이 실제로 체결됐을지(과거 호가창 없음), 실제 스프레드(실측 기반 가정값 사용), 실제 포인트 공식.
 그래서 **3일 모의 거래로 체결률과 비용을 실측**하는 단계가 필요합니다.
 
@@ -84,7 +105,7 @@ python3 -m venv .venv && . .venv/bin/activate      # Python 3.11 이상
 pip install -e ".[dev]"
 cp config.example.yaml config.yaml                   # 금액·종목 수정
 cp .env.example .env                                 # testnet/live 때만 키 입력
-pytest -q                                            # 69개 테스트
+pytest -q                                            # 72개 테스트
 ```
 
 ## 4. 사용 순서
@@ -125,6 +146,13 @@ hedgebot check --mode live
 hedgebot run --mode live --i-understand-live
 ```
 처음 1~2주는 `config.yaml`의 `notional_usd`를 줄여서($500~1,000 규모) 실제 수수료와 포인트를 확인한 뒤 늘리세요.
+
+### 리밸런싱 (돈은 직접 이체)
+```bash
+hedgebot rebalance                              # 지금 옮겨야 할 금액과 방향
+hedgebot rebalance --apply                      # paper 모드에서만: 모의 잔고에 이체를 반영
+hedgebot backtest --days 45 --rebalance-every-h 72
+```
 
 ### 비상 정리
 ```bash
@@ -168,6 +196,7 @@ hedgebot flatten --mode live --confirm --i-understand-live   # 모든 봇 포지
 | `risk.backstop_isolated_buffer_pct` | 2 | 격리 포지션 손절: 청산가 몇 % 앞 |
 | `risk.stop_cooldown_h` | 6 | 한쪽이 닫힌 뒤 재진입까지 대기. 0이면 자동 재진입 안 함 |
 | `risk.isolated_topup_enabled / target_pct` | true / 15 | Entropy 포지션이 청산가 8% 이내면 여유 잔고로 보충해 15%로 되돌림 |
+| `rebalance.enabled / every_h / venues` | true / 72 / arcus, hl:io | 정기 리밸런싱 알림. `capital` 비율로 다시 나눈 이체 금액을 텔레그램으로 알림 |
 
 ---
 
@@ -191,9 +220,10 @@ hedgebot/
   executor.py            페어 상태 머신: BUILD → HOLD → UNWIND, 메이커 클립 + 헤지 + 불균형 수리
   risk.py                계정 증거금 비율, 격리 청산 거리, 일일 손실 한도
   backstop.py            거래소에 걸어 두는 손절 주문 관리
+  rebalance.py           거래소 간 리밸런싱 이체 계산
   strategy.py            방향·회전·베이시스·사이징 규칙 (실거래와 백테스트가 공유)
   engine.py              메인 루프, 데드맨 스위치, 스냅샷, 수수료 대조
   backtest/              과거 캔들·펀딩 재생 시뮬레이터
   scanner.py, report.py, journal.py, cli.py
-tests/                   69개 (서명, 체결, 헤지 실패, 불균형, 회전, 리스크, 거래소 손절, 백테스트)
+tests/                   72개 (서명, 체결, 헤지 실패, 불균형, 회전, 리스크, 거래소 손절, 백테스트)
 ```

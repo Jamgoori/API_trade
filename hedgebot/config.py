@@ -163,6 +163,20 @@ class PaperConfig:
 
 
 @dataclass
+class RebalanceConfig:
+    """Scheduled reminder to move money between venues (you do the transfer; the bot only computes it).
+
+    Every `every_h` hours the equity of `venues` is pooled and split again in the proportions of
+    `capital`, e.g. arcus 7000 : hl:io 5250. Transfers below `min_transfer_usd` are skipped.
+    """
+
+    enabled: bool = False
+    every_h: float = 72
+    venues: list[str] = field(default_factory=lambda: ["arcus", "hl:io"])
+    min_transfer_usd: Decimal = Decimal(200)
+
+
+@dataclass
 class PointsConfig:
     # Community self-reports: ~41-46 Arcus points per $1.2-1.5M of mostly-RWA volume per week.
     arcus_points_per_musd: Decimal = Decimal(33)
@@ -181,6 +195,7 @@ class Config:
     poll: PollConfig = field(default_factory=PollConfig)
     paper: PaperConfig = field(default_factory=PaperConfig)
     points: PointsConfig = field(default_factory=PointsConfig)
+    rebalance: RebalanceConfig = field(default_factory=RebalanceConfig)
     journal_path: str = "data/journal.sqlite"
     log_dir: str = "data/logs"
 
@@ -329,6 +344,15 @@ def validate(cfg: Config) -> None:
         raise ConfigError("execution.hedge_slippage_bps needs at least one step")
     if cfg.execution.hedge_mode not in ("taker", "passive_first"):
         raise ConfigError("execution.hedge_mode must be taker or passive_first")
+    rb = cfg.rebalance
+    if rb.enabled:
+        if len(rb.venues) < 2:
+            raise ConfigError("rebalance.venues needs at least two venues")
+        missing = [v for v in rb.venues if D(cfg.capital.get(v, 0)) <= 0]
+        if missing:
+            raise ConfigError(f"rebalance: set capital for {missing} (it defines the target split)")
+        if rb.every_h <= 0:
+            raise ConfigError("rebalance.every_h must be positive")
     for name in cfg.venues_needed():
         if name.startswith("hl:") and name[3:] not in cfg.hyperliquid.dexes:
             raise ConfigError(f"venue {name} is used by a pair but not listed in hyperliquid.dexes")

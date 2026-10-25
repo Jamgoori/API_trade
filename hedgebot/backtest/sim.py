@@ -70,6 +70,10 @@ class BacktestParams:
     isolated_topup_enabled: bool = True
     isolated_topup_target_pct: float = 15
     rotation_enabled: bool = True  # False disables rotation for every pair (hold-only variant)
+    # scheduled manual rebalancing: every N hours pool these venues and split them by `capital`
+    rebalance_every_h: float | None = None
+    rebalance_venues: tuple[str, ...] = ("arcus", "hl:io")
+    rebalance_min_usd: float = 200
     max_account_leverage: float = 5
     hedge_slippage_bps: float = 0.3
     maker_adverse_bps: float = 0.5
@@ -122,6 +126,9 @@ class BacktestResult:
     transfer_usd: float
     daily_equity: list[tuple[int, dict[str, float]]]
     groups: dict[str, str] = field(default_factory=dict)
+    rebalances: int = 0
+    rebalance_usd: float = 0.0
+    min_iso_distance_pct: dict[str, float] = field(default_factory=dict)
 
     @property
     def days(self) -> float:
@@ -293,7 +300,10 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
     equity = {v: float(params.capital.get(v, 0.0)) for v in venues}
     start_equity = dict(equity)
     min_ratio = {v: math.inf for v in venues}
-    totals = {"transfers": 0, "transfer_usd": 0.0}
+    totals = {"transfers": 0, "transfer_usd": 0.0, "rebalances": 0, "rebalance_usd": 0.0}
+    min_iso: dict[str, float] = {}
+    next_rebalance = (timeline[0] + int(params.rebalance_every_h * HOUR_MS)) if (timeline and params.rebalance_every_h) \
+        else None
     daily: list[tuple[int, dict[str, float]]] = []
     day_cost: dict[int, float] = {}
     state = {"off": False}
@@ -341,6 +351,69 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
         p.res.slippage += m_slip + h_slip
         day = t // DAY_MS
         day_cost[day] = day_cost.get(day, 0.0) + m_fee + h_fee + max(0.0, m_slip) + max(0.0, h_slip)
+
+    def iso_value(p: "_Pair", maker_leg: bool, i: int) -> float:
+        """Posted isolated margin plus the position's unrealised PnL (what the position holds)."""
+        (_, _, mc), (_, _, hc) = p.bar(i)
+        if maker_leg:
+            return p.iso_m + p.qty * (mc - p.entry_m)
+        return p.iso_h + (-p.qty * p.ratio) * (hc - p.entry_h)
+
+    def free_cash(venue: str, i: int) -> tuple[float, float]:
+        """(free balance, extra that could be released from isolated positions down to their IM)."""
+        free, removable = equity[venue], 0.0
+        for p, size, spec, is_maker in legs_on(venue):
+            (_, _, mc), (_, _, hc) = p.bar(i)
+            im = abs(size) * (mc if is_maker else hc) / leg_lev(p, spec, venue, False)
+            if spec.isolated:
+                value = iso_value(p, is_maker, i)
+                free -= value
+                removable += max(0.0, value - im)
+            else:
+                free -= im
+        return max(0.0, free), removable
+
+    def withdraw(venue: str, amount: float, i: int) -> None:
+        free, removable = free_cash(venue, i)
+        equity[venue] -= amount
+        rest = amount - free
+        if rest <= 0 or removable <= 0:
+            return
+        for p, size, spec, is_maker in legs_on(venue):
+            if not spec.isolated:
+                continue
+            (_, _, mc), (_, _, hc) = p.bar(i)
+            im = abs(size) * (mc if is_maker else hc) / leg_lev(p, spec, venue, False)
+            share = max(0.0, iso_value(p, is_maker, i) - im) / removable * rest
+            if is_maker:
+                p.iso_m -= share
+            else:
+                p.iso_h -= share
+
+    def rebalance(i: int) -> None:
+        venues_r = [v for v in params.rebalance_venues if v in equity]
+        weights = {v: float(params.capital.get(v, 0.0)) for v in venues_r}
+        total_w = sum(weights.values())
+        if len(venues_r) < 2 or total_w <= 0:
+            return
+        pool = sum(equity[v] for v in venues_r)
+        delta = {v: pool * weights[v] / total_w - equity[v] for v in venues_r}
+        for src in sorted(venues_r, key=lambda v: delta[v]):
+            if delta[src] >= 0:
+                continue
+            for dst in sorted(venues_r, key=lambda v: -delta[v]):
+                if delta[dst] <= 0 or src == dst:
+                    continue
+                free, removable = free_cash(src, i)
+                amount = min(-delta[src], delta[dst], free + removable)
+                if amount < params.rebalance_min_usd:
+                    continue
+                withdraw(src, amount, i)
+                equity[dst] += amount
+                delta[src] += amount
+                delta[dst] -= amount
+                totals["rebalances"] += 1
+                totals["rebalance_usd"] += amount
 
     def trade(p: "_Pair", delta: float, i: int, t: int, urgent: bool = False) -> None:
         """Move the maker leg by delta (the hedge by -delta*ratio) at the bar close."""
@@ -482,6 +555,7 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
                 if liq is None:
                     continue
                 worst = (extreme - liq) / extreme if size > 0 else (liq - extreme) / extreme
+                min_iso[venue] = min(min_iso.get(venue, 1e9), worst * 100)
                 if params.backstop_enabled and worst <= params.backstop_isolated_buffer_pct / 100:
                     liquidate(p, maker_leg, extreme, i, t, stop=True)
                     continue
@@ -495,7 +569,7 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
                         need = (liq - close * (1 - target)) * size * (1 - spec.mmf)
                     else:
                         need = (close * (1 + target) - liq) * abs(size) * (1 + spec.mmf)
-                    free = equity[venue] - margin_state(venue, i)[2]
+                    free = free_cash(venue, i)[0]
                     add = min(need, free * 0.95)
                     if add >= 5:
                         if maker_leg:
@@ -552,6 +626,10 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
                     equity[v] += amount
                     totals["transfers"] += 1
                     totals["transfer_usd"] += amount
+
+        if next_rebalance is not None and t >= next_rebalance:
+            rebalance(i)
+            next_rebalance = t + int(params.rebalance_every_h * HOUR_MS)
 
         # 4) strategy decisions at the bar close
         venue_bias: dict[str, float] = {}
@@ -639,6 +717,9 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
         start_equity=start_equity,
         end_equity=dict(equity),
         min_margin_ratio={v: (r if r != math.inf else float("nan")) for v, r in min_ratio.items()},
+        rebalances=totals["rebalances"],
+        rebalance_usd=totals["rebalance_usd"],
+        min_iso_distance_pct=min_iso,
         transfers=totals["transfers"],
         transfer_usd=totals["transfer_usd"],
         daily_equity=daily,

@@ -152,6 +152,9 @@ def cmd_backtest(args) -> int:
         backstop_isolated_buffer_pct=float(r.backstop_isolated_buffer_pct), stop_cooldown_h=r.stop_cooldown_h,
         points_per_musd=args.points_per_musd or float(cfg.points.arcus_points_per_musd),
         seed=args.seed, label="config",
+        rebalance_every_h=(args.rebalance_every_h or None) if args.rebalance_every_h is not None
+        else (cfg.rebalance.every_h if cfg.rebalance.enabled else None),
+        rebalance_venues=tuple(cfg.rebalance.venues), rebalance_min_usd=float(cfg.rebalance.min_transfer_usd),
     )
     if not args.sweep:
         print()
@@ -270,6 +273,36 @@ def cmd_check(args) -> int:
     return 0 if ok else 1
 
 
+def cmd_rebalance(args) -> int:
+    from .engine import Engine, ensure_dirs
+    from .journal import Journal
+    from .rebalance import describe
+    from .venues.paper import PaperVenue
+
+    cfg = _load(args)
+    if len(cfg.rebalance.venues) < 2:
+        raise SystemExit("set rebalance.venues in the config")
+    ensure_dirs(cfg)
+    engine = Engine(cfg, Secrets.from_env(), journal=Journal(cfg.journal_path))
+    for v in engine.venues.values():
+        v.refresh_markets()
+    transfers, equity, weights = engine.rebalance_plan()
+    print(describe(transfers, equity, weights))
+    if args.apply:
+        if cfg.mode != "paper":
+            raise SystemExit("--apply only simulates transfers in paper mode; move real funds yourself")
+        for t in transfers:
+            src, dst = engine.venues[t.source], engine.venues[t.dest]
+            assert isinstance(src, PaperVenue) and isinstance(dst, PaperVenue)
+            src.cash -= t.amount
+            dst.cash += t.amount
+            src._save()
+            dst._save()
+        engine.journal.save_pair_state("__rebalance__", {"last_ts": time.time()})
+        print("paper balances updated")
+    return 0
+
+
 def cmd_flatten(args) -> int:
     from .engine import Engine, ensure_dirs, flatten_all
 
@@ -312,6 +345,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--passive-hedge-fill-rate", type=float,
                    help="share of hedges filled as maker (default 0.5 with hedge_mode passive_first, else 0)")
     p.add_argument("--points-per-musd", type=float)
+    p.add_argument("--rebalance-every-h", type=float,
+                   help="simulate moving money between rebalance.venues every N hours (0 = off; default: config)")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--cache-dir", default="data/cache")
     p.set_defaults(func=cmd_backtest)
@@ -333,6 +368,11 @@ def main(argv: list[str] | None = None) -> int:
     p = with_config(sub.add_parser("check", help="validate config, market symbols, credentials"))
     p.add_argument("--mode", choices=["paper", "testnet", "live"])
     p.set_defaults(func=cmd_check)
+
+    p = with_config(sub.add_parser("rebalance", help="how much to move between venues to get back to plan"))
+    p.add_argument("--mode", choices=["paper", "testnet", "live"])
+    p.add_argument("--apply", action="store_true", help="paper mode only: apply the transfers to paper balances")
+    p.set_defaults(func=cmd_rebalance)
 
     p = with_config(sub.add_parser("flatten", help="emergency: close all bot positions"))
     p.add_argument("--mode", choices=["paper", "testnet", "live"])

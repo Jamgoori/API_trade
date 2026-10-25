@@ -154,6 +154,15 @@ paper:
   maker_fill: through  # through: 가격이 내 호가를 뚫고 지나가야 체결(보수적) | touch: 닿으면 체결(낙관적)
   state_dir: data/paper
 
+# 정기 리밸런싱 알림 (돈은 직접 옮기세요. 봇 키는 출금 권한이 없습니다)
+# every_h 마다 venues 의 잔고를 합쳐 capital 비율(Arcus 7000 : Entropy 5250)로 다시 나눈 이체 금액을 알려 줍니다.
+# RWA 쪽(trade.xyz)은 제외. `hedgebot rebalance` 로 언제든 확인 가능.
+rebalance:
+  enabled: true
+  every_h: 72
+  venues: [arcus, "hl:io"]
+  min_transfer_usd: 200
+
 points:
   arcus_points_per_musd: 33   # 커뮤니티 공개치 기준 추정 (RWA 위주 $100만당 약 30~40포인트)
 

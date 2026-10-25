@@ -46,6 +46,10 @@ def format_result(res: BacktestResult) -> str:
         f"    min margin ratio       " + ", ".join(f"{v} {r:.2f}" for v, r in res.min_margin_ratio.items()),
         f"    venue transfers needed {res.transfers}  (${res.transfer_usd:,.0f} moved)",
         f"    isolated top-ups       {res.topups}  (${res.topup_usd:,.0f} moved into Entropy positions)",
+        f"    scheduled rebalances   {res.rebalances}  (${res.rebalance_usd:,.0f} moved"
+        + (f", every {p.rebalance_every_h:g}h)" if p.rebalance_every_h else ", off)"),
+        f"    closest to isolated liq " + (", ".join(f"{v} {d:.1f}%" for v, d in res.min_iso_distance_pct.items())
+                                         or "n/a"),
         "",
         "  Per pair",
         f"    {'pair':<14}{'maker vol':>12}{'off-hrs':>8}{'fees':>9}{'slip':>9}{'funding':>10}{'rot':>5}{'derisk':>7}"

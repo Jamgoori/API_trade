@@ -16,6 +16,7 @@ from .executor import PairExecutor
 from .journal import Journal
 from .models import AccountState, OrderState, Side
 from .notifier import Notifier
+from .rebalance import describe, plan_transfers, weights_from
 from .risk import RiskManager
 from .util import ZERO, D
 from .venues.arcus import ArcusSigner, ArcusVenue
@@ -294,6 +295,27 @@ class Engine:
             self._log_status()
         if self._due("reconcile", 600):
             self._reconcile_fills()
+        if self.cfg.rebalance.enabled and self._due("rebalance_check", 300):
+            self._rebalance_reminder()
+
+    def rebalance_plan(self) -> tuple[list, dict, dict]:
+        rb = self.cfg.rebalance
+        equity = {v: self.account(v, 0).equity for v in rb.venues if v in self.venues}
+        weights = {v: w for v, w in weights_from(self.cfg.capital, rb.venues).items() if v in equity}
+        return plan_transfers(equity, weights, rb.min_transfer_usd), equity, weights
+
+    def _rebalance_reminder(self) -> None:
+        state = self.journal.load_pair_state("__rebalance__") or {}
+        if time.time() - float(state.get("last_ts", 0)) < self.cfg.rebalance.every_h * 3600:
+            return
+        try:
+            transfers, equity, weights = self.rebalance_plan()
+        except VenueError as exc:
+            log.warning("rebalance plan failed: %s", exc)
+            return
+        self.event("warning" if transfers else "info", "rebalance", describe(transfers, equity, weights),
+                   notify=True)
+        self.journal.save_pair_state("__rebalance__", {"last_ts": time.time()})
 
     def run(self, max_runtime_s: float | None = None) -> None:
         self._install_signals()
