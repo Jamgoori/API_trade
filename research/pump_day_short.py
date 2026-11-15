@@ -40,20 +40,23 @@ def signals(syms, ranks, thr: float, day_a: int, day_b: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def trades(syms, sig: pd.DataFrame, hold_days: int, stop) -> pd.DataFrame:
+def trades(syms, sig: pd.DataFrame, hold_days: int, stop, ban: bool = False) -> pd.DataFrame:
+    """ban: once a short on a coin is stopped out or liquidated, never short that coin again."""
     out = []
     for name, g in sig.sort_values("day").groupby("sym"):
         s = syms[name]
         free_from = -1
+        banned = False
         for e in g.itertuples():
             i = (e.day + 1) * H_DAY - s.t0
-            if i <= free_from or i >= s.n:
+            if banned or i <= free_from or i >= s.n:
                 continue
             res = sim_short(s, i, hold_days * H_DAY, 1.0, stop)
             if res is None:
                 continue
             ret, why, j = res
             free_from = j
+            banned = ban and why in ("stop", "liq")
             # mark to market at each daily close while open (return on margin, floored at a total loss)
             p0 = s.open[i] * (1 - SLIP)
             fc = np.cumsum(np.r_[0.0, s.fund[i + 1:j + 1] * s.open[i + 1:j + 1] / p0])
@@ -104,6 +107,7 @@ def main() -> None:
     ap.add_argument("--start", default="2025-01-01")
     ap.add_argument("--end", default="2026-10-31")
     ap.add_argument("--save", type=Path, default=Path(__file__).resolve().parent / "results")
+    ap.add_argument("--ban", action="store_true", help="never short a coin again after a stop or liquidation on it")
     a = ap.parse_args()
     syms = load()
     d0, ranks, _ = volume_ranks(syms)
@@ -111,12 +115,13 @@ def main() -> None:
     day_a = int(pd.Timestamp(a.start).timestamp() // 86400)
     day_b = min(int(pd.Timestamp(a.end).timestamp() // 86400), last)
 
-    lines = [f"## Short only after a big up day: volume rank 101+, 1x isolated, {a.start} .. {a.end}\n",
+    lines = [f"## Short only after a big up day: volume rank 101+, 1x isolated, {a.start} .. {a.end}"
+             + (", coin dropped for good after a stop or liquidation" if a.ban else "") + "\n",
              "Signal: daily close (UTC) at least X% above the previous close. Entry at the next 00:00 open.",
              f"Portfolio: {SLOTS} equal slots (2% margin each), new signals skipped while all slots are taken, "
              "equity marked to market at every daily close.\n",
-             "| day gain | ratio filter | hold | stop | trades | mean | median | win | liquidated | stopped | portfolio CAGR | max DD | avg open | skipped |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+             "| day gain | ratio filter | hold | stop | trades | mean | median | win | liquidated | stopped | portfolio CAGR | max DD | avg open | skipped | coins dropped |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     print("\n".join(lines), flush=True)
     for thr in (0.10, 0.20, 0.30):
         sig = signals(syms, ranks, thr, day_a, day_b)
@@ -128,18 +133,20 @@ def main() -> None:
                 for stop in (None, 0.5, 0.3):
                     if flabel != "—" and stop == 0.5:
                         continue
-                    t = trades(syms, sig[fmask], hold, stop)
+                    t = trades(syms, sig[fmask], hold, stop, ban=a.ban)
                     if t.empty:
                         continue
                     p = portfolio(t, day_a, day_b)
                     row = (f"| +{thr:.0%} | {flabel} | {hold}d | {'none' if stop is None else f'+{stop:.0%}'} | {len(t)} "
                            f"| {pct(t.ret.mean())} | {pct(t.ret.median())} | {(t.ret > 0).mean():.0%} "
                            f"| {(t.why == 'liq').mean():.1%} | {(t.why == 'stop').mean():.0%} "
-                           f"| {pct(p['cagr'], 0)} | {pct(p['maxdd'], 0)} | {p['avg_open']:.0f} | {p['skipped']} |")
+                           f"| {pct(p['cagr'], 0)} | {pct(p['maxdd'], 0)} | {p['avg_open']:.0f} | {p['skipped']} "
+                           f"| {t[t.why.isin(['stop', 'liq'])].sym.nunique()} |")
                     lines.append(row)
                     print(row, flush=True)
     a.save.mkdir(parents=True, exist_ok=True)
-    (a.save / f"pump_day_short_{a.start[:4]}_{a.end[:4]}.md").write_text("\n".join(lines) + "\n")
+    suffix = "_ban" if a.ban else ""
+    (a.save / f"pump_day_short_{a.start[:4]}_{a.end[:4]}{suffix}.md").write_text("\n".join(lines) + "\n")
 
 
 if __name__ == "__main__":
