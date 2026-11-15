@@ -37,20 +37,21 @@ MIN_TRADES = 100
 class Paths:
     """Price path of every signal over the longest holding period, relative to the entry price."""
 
-    def __init__(self, syms, sig: pd.DataFrame):
+    def __init__(self, syms, sig: pd.DataFrame, max_h: int = MAX_H):
         n = len(sig)
-        self.O = np.full((n, MAX_H), np.nan, np.float32)
-        self.H = np.full((n, MAX_H), np.nan, np.float32)
-        self.L = np.full((n, MAX_H), np.nan, np.float32)
-        self.C = np.full((n, MAX_H), np.nan, np.float32)
-        self.FC = np.zeros((n, MAX_H), np.float32)
+        self.max_h = max_h
+        self.O = np.full((n, max_h), np.nan, np.float32)
+        self.H = np.full((n, max_h), np.nan, np.float32)
+        self.L = np.full((n, max_h), np.nan, np.float32)
+        self.C = np.full((n, max_h), np.nan, np.float32)
+        self.FC = np.zeros((n, max_h), np.float32)
         self.valid = np.zeros(n, np.int32)
         self.delisted = np.zeros(n, bool)
         self.entry_h = np.zeros(n, np.int64)
         for r, e in enumerate(sig.itertuples()):
             s = syms[e.sym]
             i = (e.day + 1) * H_DAY - s.t0
-            m = max(0, min(MAX_H, s.n - i))
+            m = max(0, min(max_h, s.n - i))
             self.valid[r], self.delisted[r], self.entry_h[r] = m, s.delisted, s.t0 + i
             if m == 0:
                 continue
@@ -63,58 +64,66 @@ class Paths:
             f = s.fund[sl] * s.open[sl] / p0
             f[0] = 0.0
             self.FC[r, :m] = np.cumsum(f)
-        self.liqx = (1 + 1 + self.FC - FEE) / (1 + MMR)
         self._first = {}
 
     def first(self, kind: str, level: float) -> np.ndarray:
-        """First bar where the take-profit / stop level is touched (MAX_H if never)."""
+        """First bar where the take-profit / stop level is touched (max_h if never)."""
         key = (kind, level)
         if key not in self._first:
             with np.errstate(invalid="ignore"):
                 hit = self.L <= 1 - level if kind == "tp" else self.H >= 1 + level
             j = np.argmax(hit, axis=1)
-            j[~hit.any(axis=1)] = MAX_H
+            j[~hit.any(axis=1)] = self.max_h
             self._first[key] = j
         return self._first[key]
 
-    def outcome(self, tp: float, stop: float, hold: int):
-        """Return on margin, exit bar and exit reason code for every signal (nan where the data runs out)."""
-        hh = hold * H_DAY
+    def outcome(self, tp: float, stop: float, hold: int | None, lev: float = 1.0, truncate: bool = False):
+        """Return on margin, exit bar and exit reason code for every signal (nan where the data runs out).
+
+        hold None: no time limit, only take-profit / stop / liquidation end a trade (capped at max_h bars).
+        truncate: a trade still open when the data ends is valued at the last bar instead of being dropped.
+        """
+        hh = self.max_h if hold is None else hold * H_DAY
         n = len(self.valid)
         rows = np.arange(n)
         end = np.minimum(hh, self.valid)
-        ok = (self.valid >= hh) | (self.delisted & (self.valid >= 2))
+        ok = (self.valid >= hh) | (self.delisted & (self.valid >= 2)) | (truncate & (self.valid >= 2))
         jt, js = self.first("tp", tp), self.first("stop", stop)
         js_in = js < end
         jt_in = (jt < end) & (jt < js)  # a tie goes to the stop
         j = np.where(js_in & ~((jt < js) & jt_in), js, np.where(jt_in, jt, end - 1))
-        j = np.clip(j, 0, MAX_H - 1)
-        o, fc, liqx = self.O[rows, j], self.FC[rows, j], self.liqx[rows, j]
+        j = np.clip(j, 0, self.max_h - 1)
+        o, fc = self.O[rows, j], self.FC[rows, j]
+        liqx = (1 / lev + 1 + fc - FEE) / (1 + MMR)
         ret = np.full(n, np.nan)
         why = np.zeros(n, np.int8)  # 0 time, 1 take-profit, 2 stop, 3 liquidated
         stop_now = js_in & ~jt_in
         x_stop = np.maximum(1 + stop, o) * (1 + STOP_SLIP)
         liq = stop_now & ((o >= liqx) | (x_stop >= liqx))
-        ret = np.where(stop_now, (1 - x_stop) + fc - FEE - FEE * x_stop, ret)
+        ret = np.where(stop_now, lev * ((1 - x_stop) + fc - FEE - FEE * x_stop), ret)
         why = np.where(stop_now, 2, why)
         x_tp = np.minimum(1 - tp, o)
-        ret = np.where(jt_in, (1 - x_tp) + fc - FEE - MAKER * x_tp, ret)
+        ret = np.where(jt_in, lev * ((1 - x_tp) + fc - FEE - MAKER * x_tp), ret)
         why = np.where(jt_in, 1, why)
         timed = ~stop_now & ~jt_in
         x_end = self.C[rows, j] * (1 + SLIP)
-        ret = np.where(timed, (1 - x_end) + fc - FEE - FEE * x_end, ret)
+        ret = np.where(timed, np.maximum(-1.0, lev * ((1 - x_end) + fc - FEE - FEE * x_end)), ret)
         ret = np.where(liq, -1.0, ret)
         why = np.where(liq, 3, why)
         ret = np.where(ok, ret, np.nan)
         # mark to market at each daily close before the exit day
-        k = np.arange(hold) * H_DAY + H_DAY - 1
-        k = k[k < MAX_H]
-        mtm = np.maximum(-1.0, (1 - self.C[:, k]) + self.FC[:, k] - FEE)
+        k = np.arange(hh // H_DAY) * H_DAY + H_DAY - 1
+        k = k[k < self.max_h]
+        mtm = np.maximum(-1.0, lev * ((1 - self.C[:, k]) + self.FC[:, k] - FEE))
         return ret, j, why, mtm
 
 
-def run_combo(sig: pd.DataFrame, paths: Paths, mask: np.ndarray, tp, stop, hold, ban, day_a, day_b):
-    ret, j, why, mtm = paths.outcome(tp, stop, hold)
+def run_combo(sig: pd.DataFrame, paths: Paths, mask: np.ndarray, tp, stop, hold, ban, day_a, day_b,
+              margin_frac: float | None = None, lev: float = 1.0, truncate: bool = False):
+    """margin_frac: margin per position as a share of equity (default 1/SLOTS); at most 1/margin_frac open."""
+    ret, j, why, mtm = paths.outcome(tp, stop, hold, lev, truncate)
+    frac = margin_frac or 1 / SLOTS
+    slots = int(round(1 / frac))
     order = np.flatnonzero(mask)
     taken = []
     state: dict[str, tuple[int, bool]] = {}
@@ -157,10 +166,10 @@ def run_combo(sig: pd.DataFrame, paths: Paths, mask: np.ndarray, tp, stop, hold,
         todays = by_day.get(day, [])
         rng.shuffle(todays)
         for t in todays:
-            if len(open_) >= SLOTS:
+            if len(open_) >= slots:
                 skipped += 1
                 continue
-            m = equity / SLOTS
+            m = equity * frac
             cash -= m
             open_.append((m, t, int(sig.day.iat[t] + 1 + j[t] // H_DAY), int(sig.day.iat[t] + 1)))
         curve.append(cash + sum(p[0] * (1 + val(p, day)) for p in open_))
