@@ -1,38 +1,101 @@
-# Small-cap short research (Binance USD-M)
+# 잡코인 숏 리서치 (바이낸스 USDⓈ-M 선물)
 
-Question: does shorting Binance small-cap perps mechanically pay, and can a pump signal tell
-"stop out" from "this will dump"?
+질문 두 가지:
+1. 잡코인 선물을 기계적으로 숏하는 "양계장"이 돈이 되나?
+2. 펌핑 신호로 "손절해야 할 펌핑"과 "곧 덤프될 펌핑"을 구별할 수 있나?
 
-## Data
+전체 결과 표는 [`results/report.md`](results/report.md)에 있어요. 원자료는 `results/*.csv`예요.
 
-`binance_data.py` downloads 1h klines and funding for every USDT-margined coin perp from
-[data.binance.vision](https://data.binance.vision), including delisted symbols, so dead coins are in the sample.
-Equities, commodities, FX, pre-IPO, index, RWA and stablecoin perps are dropped using
-`underlyingType`/`underlyingSubType` from `exchangeInfo`. Raw files are cached under `data/binance/` (gitignored).
+## 데이터
+
+- `binance_data.py`가 [data.binance.vision](https://data.binance.vision)에서 1시간봉, 펀딩, 5분 단위 OI·롱숏비율을 받아요.
+- **상장폐지된 코인도 포함돼요.** 죽은 코인까지 다 들어간 표본이에요.
+  - 바이낸스는 상폐 후에도 거래량 0에 가격이 멈춘 봉을 계속 올려둬요. 마지막 거래 시점에서 잘라냈어요.
+- 주식, 원자재, FX, 상장 전 주식(pre-IPO), 지수, RWA, 스테이블코인 선물은 `exchangeInfo`의 `underlyingType`/`underlyingSubType`으로 걸러냈어요.
+- 대상은 코인 670개(상폐 161개 포함), 기간은 2021-01부터 2026-10까지예요. OI·롱숏비율은 2021-12부터 있어요.
+- 원본 파일은 `data/binance/`에 캐시돼요(gitignore 대상, 약 1GB).
 
 ```bash
 python3 research/binance_data.py --start 2021-01 --end 2026-10 --workers 48
 ```
 
 ```bash
-python3 research/short_study.py --part all
+python3 research/short_study.py --part all > research/results/report.md
 ```
 
-## Method
+## 가정
 
-- **Tier**: each coin's rank by trailing 30-day average daily volume, using only past days.
-  "101+" = outside the top 100 by volume; "31–100" = the next band below the majors.
-- **Trades**: enter at a 1h bar open; 0.05% taker fee and 0.1% slippage per side; 0.5% extra slippage on stop
-  fills; funding paid/received every interval on the current notional.
-- **Isolated margin**: liquidation when equity falls to a 2.5% maintenance margin; a liquidated position loses
-  its whole margin. A stop fills at the worse of the stop price and the bar open (gaps).
-- **Pump signal**: 4h return ≥ +20% and that hour's volume ≥ 5× its trailing 7-day hourly average.
-- **BTC hedge**: a BTC long with the same notional as each short, opened and closed with it
-  (needs extra margin on top of the shorts).
+- **티어**: 직전 30일 평균 거래대금 순위예요. 그날 이전 데이터만 써요. "101+"는 거래대금 100위 밖이에요.
+- **체결**: 1시간봉 시가에 진입해요.
+  - 테이커 수수료 0.05%, 슬리피지 편도 0.1%
+  - 손절 체결은 슬리피지 0.5%를 추가하고, 손절가와 봉 시가 중 불리한 쪽으로 체결해요(갭 반영).
+- **펀딩**: 매 펀딩 시점에 현재 노셔널 기준으로 정산해요.
+- **Isolated 청산**: 유지증거금 2.5%로 가정했어요. 청산되면 그 포지션 증거금 전액을 잃어요.
+- **펌핑 신호**: 4시간 수익률 +20% 이상, 그리고 그 시간 거래대금이 직전 7일 시간당 평균의 5배 이상
+- **BTC 헤지**: 숏마다 같은 노셔널의 BTC 롱을 같이 열고 닫아요. 증거금이 추가로 필요해요.
 
-Limits: 1h bars hide moves inside the hour; the 2.5% maintenance margin is a simplification of Binance's
-tiered brackets; equal margin per coin ignores that the smallest coins cannot absorb much size.
+## 결과
 
-## Results
+### 1. 양계장(잡코인 전부 숏)은 손실이 났어요
 
-See `results/` for the raw CSVs. Summary below.
+30일마다 해당 티어 코인 전부를 같은 증거금으로 숏하고 30일 보유했어요. 2021-02부터 2026-09까지 67개 코호트, 101+ 티어는 코호트당 평균 175개 코인이에요.
+
+| 티어 | 레버리지 | 손절 | 연환산 | 최대 낙폭 | BTC 헤지 시 연환산 |
+|---|---|---|---|---|---|
+| 101+ | 1x | 없음 | −45% | −98% | −24% |
+| 101+ | 1x | +30% | −32% | −91% | −14% |
+| 101+ | 1x | 펌핑 신호 시 청산 | −42% | −96% | −20% |
+| 101+ | 1.5x | 없음 | −76% | −100% | −48% |
+| 31–100 | 1x | +30% | −23% | −78% | +2% (낙폭 −58%) |
+
+- 연도별(101+, 1x, 손절 없음)로는 2025년(+8%)만 플러스였어요. 2022년 하락장에서도 −17%였어요.
+- 이유는 두 가지예요:
+  - 하락장 중간의 반등장(30일 +30~35%)이 숏을 크게 깎아요.
+  - 매달 다시 진입하는 구조라 변동성 손실(volatility drag)이 생겨요.
+- 손절은 손실을 줄이지만 플러스로 만들지는 못했어요. 펌핑 신호 청산은 단순한 +30% 손절보다 못했어요.
+
+### 2. 펌핑 직후는 동전 던지기예요. 대부분 떨어지지만 평균은 0이에요
+
+펌핑 신호 3,693건을 봤어요.
+
+- 7일 뒤 수익률은 **중앙값 −11.3%, 평균 −0.5%**였어요. 대부분 떨어지지만 소수가 크게 더 올라서 평균이 0이 돼요.
+- 추가 +20%와 −20% 중 어느 쪽에 먼저 닿는지는 **44% 대 43%**로 거의 반반이었어요.
+- 신호 후 7일 안에 **10%가 추가로 +95% 이상** 올랐어요. 1x 숏이 청산되는 구간이에요. 22%는 추가로 +50% 이상 올랐어요.
+- 펀딩이 플러스(롱이 지불)일 때 오히려 더 올랐어요(7일 평균 +9.5%). 펀딩 마이너스(숏 쏠림)는 특별히 더 위험하지 않았어요.
+- 상장 30일 이내 코인의 펌핑은 더 이어졌어요(7일 평균 +10.8%).
+
+### 3. 펌핑 직후 무조건 숏도 손실이에요
+
+1x, 7일 보유 기준이에요.
+
+- 신호 직후 숏, 손절 없음: 승률 65%, 중앙값 +9.2%인데 **평균 −2.3%**, 청산 10.6%
+- +30% 손절을 걸면 평균 −1.3%
+- 4시간·24시간·72시간 늦게 들어가도 평균은 플러스가 되지 않았어요.
+
+### 4. 롱숏 계정비율로 위험한 펌핑과 좋은 펌핑이 갈렸어요
+
+1x, +30% 손절, 7일 보유 기준이에요. 신뢰구간은 같은 달 펌핑끼리 묶어서 월 단위로 리샘플한 부트스트랩이에요.
+
+| 신호 시점 조건 | 거래 수 | 평균 | 승률 | 평균의 90% 구간 | 2021-12..2024 | 2025..2026 |
+|---|---|---|---|---|---|---|
+| 조건 없음 | 3,337 | −1.0% | 55% | −1.9% ~ −0.1% | −1.2% | −1.0% |
+| 롱숏 계정비율 > 1.5 | 1,072 | +1.7% | 61% | +0.1% ~ +3.3% | +1.3% | +1.8% |
+| 롱숏 계정비율 > 1.5 그리고 4시간 OI +50% 이상 | 237 | **+5.6%** | 70% | +2.8% ~ +7.9% | +4.3% (n=31) | +5.8% (n=206) |
+| 롱숏 계정비율 < 0.7 | 488 | **−4.6%** | 46% | −6.5% ~ −2.8% | −3.2% | −5.4% |
+
+- **계정 대부분이 숏인 펌핑(비율 < 0.7)은 스퀴즈가 이어졌어요.** 추가 +20%가 먼저 올 확률이 52%, −20%가 먼저 올 확률은 37%였어요. 숏을 정리해야 하는 신호로 쓸 만해요.
+- **계정 대부분이 롱이고 OI가 급증한 펌핑**은 숏이 플러스였어요. 레버리지 롱이 몰린 펌핑이라 털리는 쪽이에요.
+  - 거래당 증거금 5%를 쓰면 누적 +92%, 최대 낙폭 −8%였어요.
+  - 동시 보유는 최대 14개였어요.
+  - 수익 대부분은 2025~2026년에서 나왔어요.
+
+## 한계
+
+- 그룹을 25개 정도 나눠서 봤어요. 가장 좋은 조합은 우연히 좋게 나왔을 가능성이 있어요.
+  - 구간 경계(0.7, 1.5, +50%)는 결과를 보기 전에 정했어요.
+  - 하지만 두 조건을 조합한 건 결과를 보고 나서였어요.
+- 좋은 조합의 표본 대부분(206/237)이 2025~2026년이에요. 다른 장세에서는 검증이 약해요.
+- 1시간봉이라 봉 안의 움직임이 안 보여요. 펌핑 중 실제 슬리피지는 가정보다 클 수 있어요.
+  - +30% 손절을 걸었는데도 최악 거래는 −43%였어요.
+- 유지증거금 2.5%는 바이낸스 구간별 증거금 체계를 단순화한 거예요.
+- 코인마다 같은 증거금을 가정했는데, 아주 작은 코인은 큰 금액을 소화하지 못해요.

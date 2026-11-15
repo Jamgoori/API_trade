@@ -131,7 +131,7 @@ def metrics(sym: str, day: str) -> pd.DataFrame | None:
     if path is None:
         return None
     df = _read_zip_csv(path, METRIC_COLS)
-    df["ts"] = pd.to_datetime(df["create_time"]).astype("int64") // 10**9
+    df["ts"] = (pd.to_datetime(df["create_time"]) - pd.Timestamp(0)) // pd.Timedelta(seconds=1)
     return df.drop(columns=["create_time", "symbol"]).sort_values("ts")
 
 

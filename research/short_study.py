@@ -50,9 +50,15 @@ class Sym:
 def load(min_bars: int = 24 * 14) -> dict[str, Sym]:
     raw = {}
     for p in sorted((ROOT / "panel").glob("*.npz")):
-        z = np.load(p)
-        if len(z["t"]) >= min_bars:
-            raw[p.stem] = z
+        z = dict(np.load(p))
+        # Binance keeps publishing flat, zero-volume bars after a delisting: cut the series at the last trade.
+        traded = np.flatnonzero(z["qvol"] > 0)
+        if len(traded) < min_bars:
+            continue
+        a, b = traded[0], traded[-1] + 1
+        for k in ("t", "open", "high", "low", "close", "qvol", "taker_buy_qvol"):
+            z[k] = z[k][a:b]
+        raw[p.stem] = z
     last = max(int(z["t"][-1]) for z in raw.values())
     out = {}
     for name, z in raw.items():
@@ -350,7 +356,7 @@ def main() -> None:
                 for stop, sig in variants:
                     c = cohorts(syms, d0, ranks, tier=tier, hold_days=30, lev=lev, stop=stop, hedge=hedge,
                                 start_day=first_day, end_day=last_day - 30, exit_on_signal=sig)
-                    c["tier"], c["lev"], c["stop"], c["signal_exit"] = str(tier), lev, str(stop), sig
+                    c["tier"], c["lev"], c["stop_level"], c["signal_exit"] = str(tier), lev, str(stop), sig
                     allc.append(c)
                     st, sh = equity_stats(c["ret"], 365 / 30), equity_stats(c["hedged"], 365 / 30)
                     tname = "31–100" if tier[0] == 30 else "101+"
@@ -377,21 +383,6 @@ def main() -> None:
         ev = find_events(syms, d0, ranks, r4_min=0.20, vol_mult=5)
         fw = forward(syms, ev)
         fw.to_csv(a.save / "events.csv", index=False)
-
-    if a.part in ("oi", "all"):
-        ox = add_oi(fw)
-        ox.to_csv(a.save / "events_oi.csv", index=False)
-        ox = ox.dropna(subset=["oi_4h"])
-        print(f"## 4. Open interest at the signal ({len(ox)} events with Binance metrics, Dec 2021 onward)\n")
-        ox["oi4"] = pd.cut(ox.oi_4h, [-1, 0, 0.25, 0.5, 1, 1e9],
-                           labels=["OI fell", "OI +0–25%", "OI +25–50%", "OI +50–100%", "OI more than doubled"])
-        print("### by 4h open interest change (coin units, so price moves alone do not raise it)\n")
-        print(fwd_table(ox, "oi4"))
-        ox["ls"] = pd.cut(ox.ls_accounts, [0, 0.7, 1.0, 1.5, 1e9],
-                          labels=["< 0.7 (most accounts short)", "0.7–1.0", "1.0–1.5", "> 1.5 (most accounts long)"])
-        print("\n### by long/short account ratio\n")
-        print(fwd_table(ox, "ls"))
-        print(flush=True)
 
     if a.part in ("events", "all"):
         print("## 2. After a pump: 4h return >= +20% and hourly volume >= 5x its 7-day average\n")
@@ -425,6 +416,45 @@ def main() -> None:
                 t = pd.DataFrame(res, columns=["ret", "why", "j"])
                 print(f"| {label} | {'none' if stop is None else f'+{stop:.0%}'} | {len(t)} | {pct(t.ret.mean())} | {pct(t.ret.median())} "
                       f"| {(t.ret > 0).mean():.0%} | {(t.why == 'liq').mean():.1%} | {(t.why == 'stop').mean():.0%} |", flush=True)
+
+    if a.part in ("oi", "all"):
+        ox = add_oi(fw)
+        ox.to_csv(a.save / "events_oi.csv", index=False)
+        ox = ox.dropna(subset=["oi_4h"])
+        print(f"\n## 4. Open interest at the signal ({len(ox)} events with Binance metrics, Dec 2021 onward)\n")
+        ox["oi4"] = pd.cut(ox.oi_4h, [-1, 0, 0.25, 0.5, 1, 1e9],
+                           labels=["OI fell", "OI +0–25%", "OI +25–50%", "OI +50–100%", "OI more than doubled"])
+        print("### by 4h open interest change (coin units, so price moves alone do not raise it)\n")
+        print(fwd_table(ox, "oi4"))
+        ox["ls"] = pd.cut(ox.ls_accounts, [0, 0.7, 1.0, 1.5, 1e9],
+                          labels=["< 0.7 (most accounts short)", "0.7–1.0", "1.0–1.5", "> 1.5 (most accounts long)"])
+        print("\n### by long/short account ratio\n")
+        print(fwd_table(ox, "ls"))
+        print(flush=True)
+
+        print("## 5. Short the pump only when the crowd is long: 1x, +30% stop, hold 7 days\n")
+        print("90% interval: bootstrap that resamples whole months, since pumps cluster in time.\n")
+        print("| filter at the signal | trades | mean | median | win rate | 90% interval of the mean | 2021-12..2024 | 2025..2026 |")
+        print("|---|---|---|---|---|---|---|---|")
+        ox["year"] = pd.to_datetime(ox.abs_h * 3600, unit="s").dt.year
+        ox["month"] = pd.to_datetime(ox.abs_h * 3600, unit="s").dt.to_period("M")
+        rng = np.random.default_rng(0)
+        for label, m in [("any", ox.ls_accounts.notna()),
+                         ("long/short accounts > 1.5", ox.ls_accounts > 1.5),
+                         ("long/short accounts > 1.5 and 4h OI > +50%", (ox.ls_accounts > 1.5) & (ox.oi_4h > 0.5)),
+                         ("long/short accounts < 0.7", ox.ls_accounts < 0.7)]:
+            d = ox[m].copy()
+            d["ret"] = [(sim_short(syms[e.sym], e.h + 1, 168, 1.0, 0.3) or (np.nan,))[0] for e in d.itertuples()]
+            d = d.dropna(subset=["ret"])
+            by = {k: v.ret.to_numpy() for k, v in d.groupby("month")}
+            months = list(by)
+            boot = [np.concatenate([by[months[k]] for k in rng.integers(0, len(months), len(months))]).mean()
+                    for _ in range(2000)]
+            lo, hi = np.percentile(boot, [5, 95])
+            early, late = d[d.year <= 2024].ret, d[d.year >= 2025].ret
+            print(f"| {label} | {len(d)} | {pct(d.ret.mean())} | {pct(d.ret.median())} | {(d.ret > 0).mean():.0%} "
+                  f"| {pct(lo)} to {pct(hi)} | {pct(early.mean())} (n={len(early)}) | {pct(late.mean())} (n={len(late)}) |")
+        print(flush=True)
 
 
 if __name__ == "__main__":
