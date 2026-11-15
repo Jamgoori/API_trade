@@ -187,11 +187,18 @@ def run_combo(sig: pd.DataFrame, paths: Paths, mask: np.ndarray, tp, stop, hold,
 
 
 def main() -> None:
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--period", nargs=3, action="append", metavar=("NAME", "START", "END"),
+                    help="scoring period; give two (default 2022-24 and 2025-26)")
+    ap.add_argument("--out", default="tp_grid.csv", help="file name under results/")
+    args = ap.parse_args()
     out_dir = Path(__file__).resolve().parent / "results"
     syms = load()
     d0, ranks, _ = volume_ranks(syms)
     last = max(s.t0 + s.n for s in syms.values()) // H_DAY - 1
-    periods = {"2022-24": ("2022-01-01", "2024-12-31"), "2025-26": ("2025-01-01", "2026-10-31")}
+    periods = ({n: (a, b) for n, a, b in args.period} if args.period
+               else {"2022-24": ("2022-01-01", "2024-12-31"), "2025-26": ("2025-01-01", "2026-10-31")})
     rows = []
     for pname, (a, b) in periods.items():
         day_a = int(pd.Timestamp(a).timestamp() // 86400)
@@ -211,7 +218,7 @@ def main() -> None:
                              "hold": hold, "ban": ban, **res})
             del paths
     df = pd.DataFrame(rows)
-    df.to_csv(out_dir / "tp_grid.csv", index=False)
+    df.to_csv(out_dir / args.out, index=False)
     print(f"{len(df)} rows written", flush=True)
 
 
