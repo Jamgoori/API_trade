@@ -119,7 +119,7 @@ class Paths:
 
 
 def run_combo(sig: pd.DataFrame, paths: Paths, mask: np.ndarray, tp, stop, hold, ban, day_a, day_b,
-              margin_frac: float | None = None, lev: float = 1.0, truncate: bool = False):
+              margin_frac: float | None = None, lev: float = 1.0, truncate: bool = False, return_curve: bool = False):
     """margin_frac: margin per position as a share of equity (default 1/SLOTS); at most 1/margin_frac open."""
     ret, j, why, mtm = paths.outcome(tp, stop, hold, lev, truncate)
     frac = margin_frac or 1 / SLOTS
@@ -182,7 +182,8 @@ def run_combo(sig: pd.DataFrame, paths: Paths, mask: np.ndarray, tp, stop, hold,
     w = why[taken]
     return {"trades": len(taken), "mean": float(np.mean(r)), "median": float(np.median(r)),
             "win": float(np.mean(r > 0)), "tp_rate": float(np.mean(w == 1)), "stop_rate": float(np.mean(w >= 2)),
-            "cagr": cagr, "maxdd": maxdd, "calmar": cagr / abs(maxdd) if maxdd < 0 else np.nan, "skipped": skipped}
+            "cagr": cagr, "maxdd": maxdd, "calmar": cagr / abs(maxdd) if maxdd < 0 else np.nan, "skipped": skipped,
+            **({"curve": eq} if return_curve else {})}
 
 
 def main() -> None:
