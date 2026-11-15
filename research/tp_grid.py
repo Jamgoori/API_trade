@@ -61,13 +61,14 @@ class Paths:
             self.valid[r], self.delisted[r], self.entry_h[r] = m, s.delisted, s.t0 + i
             if m == 0:
                 continue
-            p0 = (e.entry_px if has_px else s.open[i]) * (1 - SLIP)
+            px = e.entry_px if has_px and not pd.isna(e.entry_px) else s.open[i]
+            p0 = px * (1 - SLIP)
             sl = slice(i, i + m)
             self.O[r, :m] = s.open[sl] / p0
             self.H[r, :m] = s.high[sl] / p0
             self.L[r, :m] = s.low[sl] / p0
             self.C[r, :m] = s.close[sl] / p0
-            if has_part and e.partial:
+            if has_part and e.partial is True:
                 self.O[r, 0] = 1.0
                 self.L[r, 0] = np.nan
             f = s.fund[sl] * s.open[sl] / p0
