@@ -28,7 +28,9 @@ TRIG = 0.20
 HERE = Path(__file__).resolve().parent
 
 
-def intraday_signals(syms, ranks, day_a: int, day_b: int, mode: str) -> pd.DataFrame:
+def intraday_signals(syms, ranks, day_a: int, day_b: int, mode: str, trig: float = TRIG) -> pd.DataFrame:
+    """First crossing per coin per UTC day. Also records how steep the run-up was at the crossing:
+    rise_4h (crossing price vs the close 4 hours earlier) and rise_1h (vs the open of the crossing hour)."""
     rows = []
     for name, s in syms.items():
         for day in range(max(day_a, s.t0 // H_DAY + 2), day_b + 1):
@@ -39,19 +41,21 @@ def intraday_signals(syms, ranks, day_a: int, day_b: int, mode: str) -> pd.DataF
                 continue
             ref = s.close[a - 1]
             if mode == "rolling 24h":
-                hit = np.flatnonzero(s.close[a:b] >= (1 + TRIG) * s.close[a - 24:b - 24])
+                hit = np.flatnonzero(s.close[a:b] >= (1 + trig) * s.close[a - 24:b - 24])
             elif mode == "hourly":
-                hit = np.flatnonzero(s.close[a:b] >= (1 + TRIG) * ref)
+                hit = np.flatnonzero(s.close[a:b] >= (1 + trig) * ref)
             else:
-                hit = np.flatnonzero(s.high[a:b] >= (1 + TRIG) * ref)
+                hit = np.flatnonzero(s.high[a:b] >= (1 + trig) * ref)
             if not len(hit):
                 continue
             h = a + int(hit[0])
             if mode == "instant":
-                rows.append({"sym": name, "entry_h": s.t0 + h, "entry_px": max((1 + TRIG) * ref, s.open[h]),
-                             "partial": True})
+                px = max((1 + trig) * ref, s.open[h])
+                rows.append({"sym": name, "entry_h": s.t0 + h, "entry_px": px, "partial": True,
+                             "rise_4h": px / s.close[h - 4] - 1, "rise_1h": px / s.open[h] - 1})
             elif h + 1 < s.n:
-                rows.append({"sym": name, "entry_h": s.t0 + h + 1})
+                rows.append({"sym": name, "entry_h": s.t0 + h + 1,
+                             "rise_4h": s.close[h] / s.close[h - 4] - 1, "rise_1h": s.close[h] / s.open[h] - 1})
     df = pd.DataFrame(rows)
     df["day"] = df.entry_h // H_DAY - 1
     return df
