@@ -41,6 +41,9 @@ def main() -> None:
         ("skip if majors > +2%", lambda x: x <= 0.02),
         ("skip if majors > +3%", lambda x: x <= 0.03),
         ("skip if majors moved more than ±3% (picked after seeing the table below)", lambda x: np.abs(x) <= 0.03),
+        ("skip if majors > +5%", lambda x: x <= 0.05),
+        ("skip if majors > +7%", lambda x: x <= 0.07),
+        ("skip if majors > +7% or < −3% (picked after seeing the buckets)", lambda x: (x <= 0.07) & (x >= -0.03)),
         ("only majors > +0% (reverse)", lambda x: x > 0.0),
         ("only majors > +2% (reverse)", lambda x: x > 0.02),
     ]
@@ -69,8 +72,9 @@ def main() -> None:
     sig, P, da, db = data["2024-01..2026-10"]
     ret, j, why, _ = P.outcome(0.15, 0.15, 3)
     t = sig.assign(ret=ret)[(sig.ls > 1.5) & ~np.isnan(ret)]
-    t["bucket"] = pd.cut(t.majors, [-1, -0.03, -0.01, 0.01, 0.03, 1],
-                         labels=["majors < −3%", "−3 to −1%", "−1 to +1%", "+1 to +3%", "majors > +3%"])
+    t["bucket"] = pd.cut(t.majors, [-1, -0.03, -0.01, 0.01, 0.03, 0.05, 0.07, 1],
+                         labels=["majors < −3%", "−3 to −1%", "−1 to +1%", "+1 to +3%", "+3 to +5%", "+5 to +7%",
+                                 "majors > +7%"])
     out.append("\n### Per-signal return by the majors' day (2024-01..2026-10, before one-position-per-coin and drop rules)\n")
     out.append("| majors' day | signals | per trade | win |")
     out.append("|---|---|---|---|")
