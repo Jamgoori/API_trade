@@ -22,12 +22,13 @@ PERIODS = {"2024-01..2025-06": ("2024-01-01", "2025-06-30"), "2025-07..2026-10":
            "2024-01..2026-10": ("2024-01-01", "2026-10-31")}
 
 
-def rolling_signals(syms, ranks, h_a: int, h_b: int, step: int, trig: float = 0.20) -> pd.DataFrame:
+def rolling_signals(syms, ranks, h_a: int, h_b: int, step: int, trig: float = 0.20, offset: int = 0) -> pd.DataFrame:
+    """offset: check hours are offset, offset+step, ... (UTC hour of day when step is 24)."""
     rows = []
     for name, s in syms.items():
         last_sig = -10 ** 9
         start = max(h_a, s.t0 + 25)
-        start += (-start) % step
+        start += (offset - start) % step
         for H in range(start, min(h_b, s.t0 + s.n), step):
             k = H - s.t0  # entry bar; the check uses the close of the bar before it
             if s.close[k - 1] < (1 + trig) * s.close[k - 25] or H - last_sig < 24:
