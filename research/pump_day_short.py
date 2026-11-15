@@ -26,7 +26,8 @@ def daily_close_index(s, day: int) -> int | None:
     return k if 0 <= k < s.n else None
 
 
-def signals(syms, ranks, thr: float, day_a: int, day_b: int) -> pd.DataFrame:
+def signals(syms, ranks, thr: float, day_a: int, day_b: int, min_rank: int = 100) -> pd.DataFrame:
+    """min_rank: only coins ranked below this by trailing 30-day volume (100 = outside the top 100)."""
     rows = []
     for name, s in syms.items():
         for day in range(max(day_a, s.t0 // H_DAY + 2), day_b):
@@ -34,7 +35,7 @@ def signals(syms, ranks, thr: float, day_a: int, day_b: int) -> pd.DataFrame:
             if k is None or k0 is None:
                 continue
             r = s.close[k] / s.close[k0] - 1
-            if r < thr or day not in ranks.index or not ranks.at[day, name] > 100:
+            if r < thr or day not in ranks.index or not ranks.at[day, name] > min_rank:
                 continue
             rows.append({"sym": name, "day": day, "day_ret": r})
     return pd.DataFrame(rows)

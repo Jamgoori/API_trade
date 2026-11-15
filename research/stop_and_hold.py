@@ -33,8 +33,9 @@ def atr_pct(s, day: int, n: int = 14, include_signal_day: bool = True) -> float:
     return float(np.mean(trs)) if len(trs) >= 5 else np.nan
 
 
-def load_signals(syms, ranks, da, db):
-    sig = signals(syms, ranks, 0.20, da, db).sort_values("day").reset_index(drop=True)
+def load_signals(syms, ranks, da, db, min_rank: int = 100):
+    sig = signals(syms, ranks, 0.20, da, db, min_rank).sort_values("day").reset_index(drop=True)
+    sig["rank"] = [ranks.at[d, s] for s, d in zip(sig.sym, sig.day)]
     ls = fetch_ls([(r.sym, (r.day + 1) * 86400) for r in sig.itertuples()])
     sig["ls"] = [ls.get((r.sym, (r.day + 1) * 86400), np.nan) for r in sig.itertuples()]
     sig["majors"] = [majors_day_return(syms, d) for d in sig.day]
