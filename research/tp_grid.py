@@ -99,7 +99,15 @@ class Paths:
         rows = np.arange(n)
         end = np.minimum(hh, self.valid)
         ok = (self.valid >= hh) | (self.delisted & (self.valid >= 2)) | (truncate & (self.valid >= 2))
-        jt, js = self.first("tp", tp), self.first("stop", stop)
+        jt = self.first("tp", tp)
+        if np.ndim(stop):  # one stop level per signal (e.g. volatility-based)
+            stop = np.asarray(stop, dtype=float)
+            with np.errstate(invalid="ignore"):
+                hit = self.H >= (1 + stop)[:, None]
+            js = np.argmax(hit, axis=1)
+            js[~hit.any(axis=1)] = self.max_h
+        else:
+            js = self.first("stop", stop)
         js_in = js < end
         jt_in = (jt < end) & (jt < js)  # a tie goes to the stop
         j = np.where(js_in & ~((jt < js) & jt_in), js, np.where(jt_in, jt, end - 1))
