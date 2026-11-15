@@ -35,7 +35,12 @@ MIN_TRADES = 100
 
 
 class Paths:
-    """Price path of every signal over the longest holding period, relative to the entry price."""
+    """Price path of every signal over the longest holding period, relative to the entry price.
+
+    By default a signal on `day` enters at the next 00:00 open. Optional columns in `sig` change that:
+    entry_h (absolute hour of the entry bar), entry_px (fill price inside that bar instead of its open) and
+    partial (the entry happens inside the bar: its earlier low cannot take profit, its high can still stop out).
+    """
 
     def __init__(self, syms, sig: pd.DataFrame, max_h: int = MAX_H):
         n = len(sig)
@@ -48,22 +53,28 @@ class Paths:
         self.valid = np.zeros(n, np.int32)
         self.delisted = np.zeros(n, bool)
         self.entry_h = np.zeros(n, np.int64)
+        has_h, has_px, has_part = "entry_h" in sig, "entry_px" in sig, "partial" in sig
         for r, e in enumerate(sig.itertuples()):
             s = syms[e.sym]
-            i = (e.day + 1) * H_DAY - s.t0
+            i = (e.entry_h if has_h else (e.day + 1) * H_DAY) - s.t0
             m = max(0, min(max_h, s.n - i))
             self.valid[r], self.delisted[r], self.entry_h[r] = m, s.delisted, s.t0 + i
             if m == 0:
                 continue
-            p0 = s.open[i] * (1 - SLIP)
+            p0 = (e.entry_px if has_px else s.open[i]) * (1 - SLIP)
             sl = slice(i, i + m)
             self.O[r, :m] = s.open[sl] / p0
             self.H[r, :m] = s.high[sl] / p0
             self.L[r, :m] = s.low[sl] / p0
             self.C[r, :m] = s.close[sl] / p0
+            if has_part and e.partial:
+                self.O[r, 0] = 1.0
+                self.L[r, 0] = np.nan
             f = s.fund[sl] * s.open[sl] / p0
             f[0] = 0.0
             self.FC[r, :m] = np.cumsum(f)
+        # hours from the entry bar to the last bar of each UTC day, for the daily mark to market
+        self.off0 = (H_DAY - 1 - self.entry_h % H_DAY).astype(np.int64)
         self._first = {}
 
     def first(self, kind: str, level: float) -> np.ndarray:
@@ -112,9 +123,9 @@ class Paths:
         why = np.where(liq, 3, why)
         ret = np.where(ok, ret, np.nan)
         # mark to market at each daily close before the exit day
-        k = np.arange(hh // H_DAY) * H_DAY + H_DAY - 1
-        k = k[k < self.max_h]
-        mtm = np.maximum(-1.0, lev * ((1 - self.C[:, k]) + self.FC[:, k] - FEE))
+        k = self.off0[:, None] + np.arange(hh // H_DAY + 1)[None, :] * H_DAY
+        k = np.minimum(k, self.max_h - 1)
+        mtm = np.maximum(-1.0, lev * ((1 - self.C[rows[:, None], k]) + self.FC[rows[:, None], k] - FEE))
         return ret, j, why, mtm
 
 
@@ -139,8 +150,7 @@ def run_combo(sig: pd.DataFrame, paths: Paths, mask: np.ndarray, tp, stop, hold,
     if not taken:
         return None
     taken = np.array(taken)
-    entry_day = sig.day.to_numpy()[taken] + 1
-    exit_day = entry_day + j[taken] // H_DAY
+    entry_day = paths.entry_h[taken] // H_DAY
     # portfolio with SLOTS equal slots, equity marked to market daily
     by_day: dict[int, list[int]] = {}
     for t, d in zip(taken, entry_day):
@@ -171,7 +181,7 @@ def run_combo(sig: pd.DataFrame, paths: Paths, mask: np.ndarray, tp, stop, hold,
                 continue
             m = equity * frac
             cash -= m
-            open_.append((m, t, int(sig.day.iat[t] + 1 + j[t] // H_DAY), int(sig.day.iat[t] + 1)))
+            open_.append((m, t, int((paths.entry_h[t] + j[t]) // H_DAY), int(paths.entry_h[t] // H_DAY)))
         curve.append(cash + sum(p[0] * (1 + val(p, day)) for p in open_))
     eq = np.array(curve)
     years = len(eq) / 365
