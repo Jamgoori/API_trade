@@ -1,0 +1,24 @@
+## Combination A with a majors filter (BTC/ETH/SOL average day return on the signal day)
+
+Per cell: trades, average return per trade, $10k at 15% margin per trade (max drawdown).
+
+| rule | 2024-01..2025-06 | 2025-07..2026-10 | 2024-01..2026-10 |
+|---|---|---|---|
+| all signals (current rule) | 195, +1.5%, $15,943 (-26%) | 426, +1.1%, $14,985 (-32%) | 560, +1.3%, $27,365 (-32%) |
+| skip if majors > +0% | 49, -0.5%, $8,772 (-19%) | 184, +1.6%, $14,536 (-22%) | 226, +1.0%, $12,289 (-19%) |
+| skip if majors > +1% | 80, +2.2%, $11,503 (-11%) | 250, +0.7%, $12,476 (-18%) | 318, +1.0%, $14,566 (-17%) |
+| skip if majors > +2% | 94, +2.6%, $12,666 (-15%) | 315, +0.9%, $13,216 (-28%) | 392, +1.3%, $16,105 (-27%) |
+| skip if majors > +3% | 117, +2.9%, $14,745 (-14%) | 349, +0.9%, $14,166 (-33%) | 446, +1.5%, $21,765 (-30%) |
+| skip if majors moved more than ±3% (picked after seeing the table below) | 116, +3.3%, $15,335 (-14%) | 328, +1.4%, $17,658 (-30%) | 424, +2.1%, $26,625 (-32%) |
+| only majors > +0% (reverse) | 158, +1.3%, $14,241 (-28%) | 325, +0.9%, $13,126 (-32%) | 437, +1.1%, $17,653 (-34%) |
+| only majors > +2% (reverse) | 116, -0.1%, $11,161 (-23%) | 201, +1.3%, $12,890 (-15%) | 296, +0.7%, $14,750 (-20%) |
+
+### Per-signal return by the majors' day (2024-01..2026-10, before one-position-per-coin and drop rules)
+
+| majors' day | signals | per trade | win |
+|---|---|---|---|
+| majors < −3% | 58 | -2.2% | 45% |
+| −3 to −1% | 88 | +0.8% | 56% |
+| −1 to +1% | 279 | +2.1% | 61% |
+| +1 to +3% | 225 | +0.6% | 56% |
+| majors > +3% | 272 | -0.3% | 54% |
