@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import re
 import time
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from urllib.parse import urlencode
@@ -20,6 +21,14 @@ log = logging.getLogger(__name__)
 
 MAINNET = "https://fapi.binance.com"
 TESTNET = "https://testnet.binancefuture.com"
+
+_QUERY = re.compile(r"\?[^\s'\"]*")
+
+
+def redact(text: str) -> str:
+    """Drop query strings (timestamp, signature, order details) from an error message."""
+    return _QUERY.sub("?…", text)
+
 
 # Binance error codes handled as "already done"
 NO_NEED_MARGIN_TYPE = -4046
@@ -74,8 +83,12 @@ class BinanceTrader:
         p["recvWindow"] = self.recv_window
         qs = urlencode(p)
         sig = hmac.new(self.secret, qs.encode(), hashlib.sha256).hexdigest()
-        resp = self.http.request(method, f"{path}?{qs}&signature={sig}", weight=weight,
-                                 retries=2 if method == "GET" else 0, headers={"X-MBX-APIKEY": self.key})
+        try:
+            resp = self.http.request(method, f"{path}?{qs}&signature={sig}", weight=weight,
+                                     retries=2 if method == "GET" else 0, headers={"X-MBX-APIKEY": self.key})
+        except VenueError as exc:  # network errors quote the URL: re-raise without it (and without the chain)
+            raise VenueError(redact(str(exc)), status=exc.status, payload=exc.payload,
+                             retryable=exc.retryable) from None
         try:
             return HttpClient.json_or_raise(resp, f"{method} {path}")
         except VenueError as exc:

@@ -37,6 +37,7 @@ def main(argv=None) -> None:
 
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("urllib3").setLevel(logging.WARNING)  # its DEBUG lines print full URLs
     s = Settings.from_env()
     if a.base_url:
         s.base_url = a.base_url

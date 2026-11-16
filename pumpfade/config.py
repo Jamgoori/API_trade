@@ -56,12 +56,12 @@ class Settings:
     scan_delay_s: int = 60             # run the daily scan this long after 00:00 UTC (funding settles first)
     scan_deadline_s: int = 30 * 60     # a scan later than this after 00:00 UTC is skipped as stale
     # live trading (pumpfade live): keys from BINANCE_API_KEY / BINANCE_API_SECRET, never from files in the repo
-    api_key: str | None = None
-    api_secret: str | None = None
+    api_key: str | None = field(default=None, repr=False)
+    api_secret: str | None = field(default=None, repr=False)
     live_margin_fraction: float = 0.05   # stage 1 of STRATEGY.md; raise to 0.12 once the stage-1 checks pass
     live_reduce_drawdown: float = 0.25   # below this drawdown from the equity peak, size drops to two thirds
     live_halt_drawdown: float = 0.35     # below this, new entries stop until `pumpfade live --resume`
-    telegram_token: str | None = None
+    telegram_token: str | None = field(default=None, repr=False)
     telegram_chat: str | None = None
     strategy: Strategy = field(default_factory=Strategy)
     books: tuple[BookSpec, ...] = (

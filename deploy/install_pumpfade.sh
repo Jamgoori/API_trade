@@ -20,6 +20,7 @@ fi
 .venv-pumpfade/bin/pip install --upgrade pip >/dev/null
 .venv-pumpfade/bin/pip install "requests>=2.31" "python-dotenv>=1.0" >/dev/null
 mkdir -p data
+chmod 700 data
 [ -f .env ] || { cp .env.example .env; echo ".env 생성: 텔레그램 알림을 원하면 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 를 채우세요"; }
 chmod 600 .env
 if [ "$(id -u)" -eq 0 ] && [ "$RUN_USER" != "root" ]; then

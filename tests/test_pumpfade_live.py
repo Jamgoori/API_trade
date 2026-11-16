@@ -349,3 +349,37 @@ def test_flatten_closes_everything_and_stops_new_entries(env):
     assert eng.book.all()[0].exit_reason == "manual flatten"
     notes = eng.open_signals([cand()], DAY + 5)
     assert "halted" in notes[0]
+
+
+def test_network_errors_do_not_leak_the_signed_query(caplog):
+    from pumpfade.trader import BinanceTrader
+
+    t = BinanceTrader("k" * 64, "s" * 64, "https://127.0.0.1:9")  # nothing listens there
+    t.http.timeout = 0.5
+    with pytest.raises(Exception) as ei:
+        t.signed("POST", "/fapi/v1/order", {"symbol": "TGTUSDT", "side": "SELL", "quantity": 5})
+    msg = str(ei.value)
+    assert "signature" not in msg and "timestamp" not in msg and "TGTUSDT" not in msg
+    assert ei.value.__cause__ is None and ei.value.__suppress_context__
+    assert "s" * 64 not in msg and "k" * 64 not in msg
+
+
+def test_telegram_failures_do_not_log_the_bot_token(monkeypatch, caplog):
+    import requests
+
+    from hedgebot.notifier import Notifier
+
+    token = "123456789:AAH" + "x" * 32
+    n = Notifier(token, "42")
+
+    def boom(url, **kw):
+        raise requests.ConnectionError(f"Max retries exceeded with url: {url.split('.org')[1]}")
+
+    monkeypatch.setattr(requests, "post", boom)
+    n._post("hello")
+    assert "telegram send failed" in caplog.text and token not in caplog.text
+
+
+def test_settings_repr_hides_secrets():
+    s = Settings(api_key="KEY123", api_secret="SECRET456", telegram_token="TOK789")
+    assert not any(x in repr(s) for x in ("KEY123", "SECRET456", "TOK789"))

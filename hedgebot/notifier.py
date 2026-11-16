@@ -55,7 +55,7 @@ class Notifier:
                 resp = requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
                                      json={"chat_id": self.chat, "text": text[:4000]}, timeout=10)
             except requests.RequestException as exc:
-                log.warning("telegram send failed: %s", exc)
+                log.warning("telegram send failed: %s", str(exc).replace(str(self.token), "<token>"))
                 return
             if resp.status_code == 429 and attempt == 0:
                 try:

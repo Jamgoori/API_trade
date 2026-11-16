@@ -14,6 +14,16 @@ ExecStart=@REPO@/.venv-pumpfade/bin/python -m pumpfade live --i-understand-live
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=30
+# 하드닝: 권한 상승 금지, 시스템 폴더 읽기 전용, 새로 만드는 파일(DB 등)은 본인만 읽기
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
