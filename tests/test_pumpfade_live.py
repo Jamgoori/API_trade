@@ -596,3 +596,48 @@ def test_runner_status_text_lists_live_positions(env, tmp_path):
     r.engine = eng
     text = r.status_text()
     assert "equity $" in text and "TGTUSDT (main, open)" in text and "closes in 48h" in text
+
+
+def test_fills_and_misses_are_announced(env):
+    ex, store, eng, msgs = env
+    eng.open_signals([cand()], DAY)
+    p = eng.book.all()[0]
+    ex.partial_fill(p.entry_cid, 300)
+    eng.tick()
+    opened = [m for m in msgs if "SHORT opened" in m]
+    assert len(opened) == 1 and "TGTUSDT" in opened[0] and "300 @ 1.005" in opened[0] and "time exit" in opened[0]
+    ex.set_price(1.01)                 # the rest of the limit fills
+    eng.tick()
+    eng.tick()
+    done = [m for m in msgs if "entry complete" in m]
+    assert len(done) == 1 and "1194 @" in done[0]
+    assert len([m for m in msgs if "SHORT" in m or "entry complete" in m]) == 2   # no repeats
+
+
+def test_a_signal_that_never_fills_says_so(env):
+    ex, store, eng, msgs = env
+    eng.open_signals([cand()], DAY)
+    real = ex.new_order
+    ex.new_order = lambda **p: ({"status": "EXPIRED", "executedQty": "0"} if p.get("timeInForce") == "IOC"
+                                else real(**p))  # the 10:00 IOC finds no bids within 0.3%
+    ex.now = ENTRY + HOUR_MS + 30_000
+    eng.tick()
+    assert eng.book.all()[0].status == "failed" and any("no position" in m for m in msgs)
+
+
+def test_heartbeat_pings_every_five_minutes(monkeypatch, tmp_path):
+    import requests
+
+    from pumpfade.runner import Runner
+
+    pings = []
+    monkeypatch.setattr(requests, "get", lambda url, **k: pings.append(url))
+    s = Settings(db_path=tmp_path / "h.sqlite", watch_listings=False)
+    s.heartbeat_url = "https://hc-ping.example/abc"
+    now = [ENTRY + 2 * HOUR_MS]
+    r = Runner(s, client=object(), store=Store(s.db_path), notifier=type("N", (), {"send": lambda *a, **k: None})(),
+               clock=lambda: now[0])
+    r.heartbeat(now[0])
+    r.heartbeat(now[0] + 60_000)
+    r.heartbeat(now[0] + 5 * 60_000)
+    assert pings == ["https://hc-ping.example/abc"] * 2

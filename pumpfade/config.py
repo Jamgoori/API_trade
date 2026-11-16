@@ -63,6 +63,7 @@ class Settings:
     live_halt_drawdown: float = 0.35     # below this, new entries stop until `pumpfade live --resume`
     telegram_token: str | None = field(default=None, repr=False)
     telegram_chat: str | None = None
+    heartbeat_url: str | None = field(default=None, repr=False)  # pinged every 5 min (e.g. healthchecks.io)
     strategy: Strategy = field(default_factory=Strategy)
     books: tuple[BookSpec, ...] = (
         BookSpec("limit", "limit"),          # the strategy as written (STRATEGY.md)
@@ -90,4 +91,5 @@ class Settings:
         s.live_margin_fraction = float(os.getenv("PUMPFADE_LIVE_MARGIN_FRACTION", s.live_margin_fraction))
         s.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN") or None
         s.telegram_chat = os.getenv("TELEGRAM_CHAT_ID") or None
+        s.heartbeat_url = os.getenv("PUMPFADE_HEARTBEAT_URL") or None
         return s

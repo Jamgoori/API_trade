@@ -110,9 +110,22 @@ class Runner:
         if now - (self.store.get("funding_ms") or 0) >= HOUR_MS:
             self.engine.settle_all_funding()
             self.store.put("funding_ms", now)
+        self.heartbeat(now)
         if (self.store.get("report_day") or 0) < today and since >= 35 * 60_000:
             self.notifier.send(("daily live report\n" if self.live else "daily paper report\n") + self.report())
             self.store.put("report_day", today)
+
+    def heartbeat(self, now: int) -> None:
+        """Tell an outside monitor the loop is alive. Skipped when a step fails, so a broken bot also alerts."""
+        url = self.settings.heartbeat_url
+        if not url or now - getattr(self, "_heartbeat_ms", 0) < 5 * 60_000:
+            return
+        try:
+            import requests
+            requests.get(url, timeout=10)
+            self._heartbeat_ms = now
+        except Exception as exc:
+            log.warning("heartbeat ping failed: %s", type(exc).__name__)
 
     def status_text(self) -> str:
         """Equity and open positions, for /status."""

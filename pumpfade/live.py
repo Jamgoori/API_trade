@@ -71,6 +71,7 @@ class LivePos:
     note: str = ""
     created_ms: int = 0
     flat_ms: int | None = None  # first time the exchange showed no position (cleared when it shows one again)
+    alerted_qty: float = 0.0    # quantity already announced on Telegram
 
 
 POS_FIELDS = [f.name for f in fields(LivePos)]
@@ -286,6 +287,20 @@ class LiveEngine:
             p.entry_ms = self.clock()
             p.deadline_ms = p.entry_ms + p.hold_hours * HOUR_MS
         self._protect(p)
+        if p.alerted_qty == 0 and p.status != "closing":
+            self._entry_alert(p)
+
+    def _entry_alert(self, p: LivePos) -> None:
+        """Announce a new short (first fill) and, once the entry is done, any quantity added after it."""
+        if p.qty <= p.alerted_qty + 1e-12:
+            return
+        from datetime import datetime, timedelta, timezone
+        exit_at = datetime.fromtimestamp((p.deadline_ms or 0) / 1000, timezone(timedelta(hours=9)))
+        head = "SHORT opened" if p.alerted_qty == 0 else "entry complete"
+        self.notify(f"📉 [live/{p.sleeve}] {p.symbol} {head}: {p.qty:g} @ {p.entry_avg or 0:.6g} "
+                    f"(${p.qty * (p.entry_avg or 0):,.0f}), stop {p.sl_px or 0:.6g} (+15%), "
+                    f"TP {p.tp_px or 0:.6g} (−15%), time exit {exit_at:%m-%d %H:%M} KST")
+        p.alerted_qty = p.qty
 
     def _protect(self, p: LivePos) -> None:
         """Place (or move) the closePosition stop and take-profit around the current average entry."""
@@ -358,6 +373,7 @@ class LiveEngine:
             self._take_limit_fills(p, o)
             if o and o["status"] == "FILLED":
                 p.status = "open"
+                self._entry_alert(p)
                 return
             if now < p.limit_until_ms:
                 return
@@ -373,8 +389,10 @@ class LiveEngine:
                 self._ioc_sell(p, remaining)
             if p.qty <= 0:
                 p.status, p.note = "failed", p.note or "neither the limit nor the 10:00 KST IOC filled"
+                self.notify(f"⚪ [live/main] {p.symbol}: no position ({p.note})")
             else:
                 p.status = "open"
+                self._entry_alert(p)
             return
         if p.status == "entering":  # listing entries resolve in open_listing; anything left here failed
             p.status = "failed" if p.qty <= 0 else "open"
