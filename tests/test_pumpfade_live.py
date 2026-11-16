@@ -383,3 +383,33 @@ def test_telegram_failures_do_not_log_the_bot_token(monkeypatch, caplog):
 def test_settings_repr_hides_secrets():
     s = Settings(api_key="KEY123", api_secret="SECRET456", telegram_token="TOK789")
     assert not any(x in repr(s) for x in ("KEY123", "SECRET456", "TOK789"))
+
+
+class DiagTrader:
+    spot_http = object()
+
+    def __init__(self, perms, spot=0.0):
+        self.perms, self.spot = perms, spot
+
+    def api_restrictions(self):
+        return self.perms
+
+    def spot_balance(self, asset):
+        return self.spot
+
+
+def test_selftest_diagnosis_names_missing_futures_permission_and_empty_wallet():
+    from pumpfade.selftest import diagnose
+
+    lines = []
+    ok = diagnose(DiagTrader({"enableReading": True, "enableFutures": False, "ipRestrict": True}, spot=14_932.8), 0.0,
+                  lines.append)
+    text = "\n".join(lines)
+    assert not ok and "Enable Futures is OFF" in text and "futures wallet of this key's account is empty" in text
+    assert "14,932.80" in text
+    lines.clear()
+    ok = diagnose(DiagTrader({"enableReading": True, "enableFutures": True, "enableWithdrawals": True,
+                              "ipRestrict": False}), 3_000.0, lines.append)
+    assert not ok and any("withdrawals are ON" in x for x in lines) and any("not IP-restricted" in x for x in lines)
+    lines.clear()
+    assert diagnose(DiagTrader({"enableReading": True, "enableFutures": True, "ipRestrict": True}), 3_000.0, lines.append)

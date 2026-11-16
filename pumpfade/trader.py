@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 
 MAINNET = "https://fapi.binance.com"
 TESTNET = "https://testnet.binancefuture.com"
+SPOT_MAINNET = "https://api.binance.com"  # key permissions and spot balances (selftest diagnostics only)
 
 _QUERY = re.compile(r"\?[^\s'\"]*")
 
@@ -39,6 +40,9 @@ class Filters:
     def __init__(self, tick: Decimal, step: Decimal, min_qty: Decimal, min_notional: Decimal):
         self.tick, self.step, self.min_qty, self.min_notional = tick, step, min_qty, min_notional
 
+    def __repr__(self) -> str:
+        return f"tick {self.tick}, step {self.step}, min qty {self.min_qty}, min notional {self.min_notional} USDT"
+
     def price(self, px: float, up: bool) -> Decimal:
         q = (Decimal(str(px)) / self.tick).quantize(Decimal(1), rounding=ROUND_UP if up else ROUND_DOWN)
         return (q * self.tick).normalize()
@@ -55,7 +59,8 @@ def fmt(x: Decimal | float) -> str:
 
 
 class BinanceTrader:
-    def __init__(self, api_key: str, api_secret: str, base_url: str = MAINNET, *, recv_window: int = 5000):
+    def __init__(self, api_key: str, api_secret: str, base_url: str = MAINNET, *, recv_window: int = 5000,
+                 spot_url: str | None = None):
         if not api_key or not api_secret:
             raise ValueError("BINANCE_API_KEY and BINANCE_API_SECRET are required for live trading")
         self.key = api_key
@@ -64,6 +69,10 @@ class BinanceTrader:
         self.recv_window = recv_window
         self.http = HttpClient(base_url, timeout=10, limiter=WeightLimiter(600, 25))
         self.http.session.headers["User-Agent"] = "pumpfade/0.1"
+        spot_url = spot_url or (SPOT_MAINNET if base_url == MAINNET else None)
+        self.spot_http = HttpClient(spot_url, timeout=10, limiter=WeightLimiter(600, 25)) if spot_url else None
+        if self.spot_http is not None:
+            self.spot_http.session.headers["User-Agent"] = "pumpfade/0.1"
         self.offset_ms = 0
         self._filters: dict[str, Filters] = {}
         self._filters_ms = 0
@@ -77,14 +86,18 @@ class BinanceTrader:
     def _public(self, path: str, params: dict | None = None, weight: float = 1):
         return HttpClient.json_or_raise(self.http.request("GET", path, params=params, weight=weight), path)
 
-    def signed(self, method: str, path: str, params: dict | None = None, weight: float = 1, _retry: bool = True):
+    def signed(self, method: str, path: str, params: dict | None = None, weight: float = 1, _retry: bool = True,
+               spot: bool = False):
+        http = self.spot_http if spot else self.http
+        if http is None:
+            raise VenueError(f"no spot API configured for {path}")
         p = {k: (fmt(v) if isinstance(v, (Decimal, float)) else v) for k, v in (params or {}).items() if v is not None}
         p["timestamp"] = int(time.time() * 1000) + self.offset_ms
         p["recvWindow"] = self.recv_window
         qs = urlencode(p)
         sig = hmac.new(self.secret, qs.encode(), hashlib.sha256).hexdigest()
         try:
-            resp = self.http.request(method, f"{path}?{qs}&signature={sig}", weight=weight,
+            resp = http.request(method, f"{path}?{qs}&signature={sig}", weight=weight,
                                      retries=2 if method == "GET" else 0, headers={"X-MBX-APIKEY": self.key})
         except VenueError as exc:  # network errors quote the URL: re-raise without it (and without the chain)
             raise VenueError(redact(str(exc)), status=exc.status, payload=exc.payload,
@@ -95,7 +108,7 @@ class BinanceTrader:
             code = exc.payload.get("code") if isinstance(exc.payload, dict) else None
             if code == -1021 and _retry:  # timestamp outside recvWindow: resync the clock once
                 self.sync_time()
-                return self.signed(method, path, params, weight, _retry=False)
+                return self.signed(method, path, params, weight, _retry=False, spot=spot)
             exc.code = code
             raise
 
@@ -104,6 +117,14 @@ class BinanceTrader:
         return getattr(exc, "code", None)
 
     # ------------------------------------------------------------------ account and symbols
+
+    def api_restrictions(self) -> dict:
+        """What this API key may do (enableFutures, enableWithdrawals, ipRestrict, ...)."""
+        return self.signed("GET", "/sapi/v1/account/apiRestrictions", spot=True)
+
+    def spot_balance(self, asset: str = "USDT") -> float:
+        body = self.signed("GET", "/api/v3/account", {"omitZeroBalances": "true"}, weight=20, spot=True)
+        return sum(float(b["free"]) + float(b["locked"]) for b in body.get("balances", []) if b["asset"] == asset)
 
     def dual_side_position(self) -> bool:
         return bool(self.signed("GET", "/fapi/v1/positionSide/dual")["dualSidePosition"])
