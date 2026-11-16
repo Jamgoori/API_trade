@@ -35,14 +35,23 @@ class Strategy:
     max_slippage: float = 0.003       # IOC limit: fill only within 0.3% of the best bid / ask
     taker_fee: float = 0.0005
     maker_fee: float = 0.0002
+    # listing pumps (STRATEGY.md rule 2)
+    listing_min_perp_age_days: int = 30
+    listing_entry_delay_hours: int = 1   # short this long after the listing's first hour starts
+    listing_max_detect_delay_hours: int = 3  # a listing first seen later than this after it opened is ignored
+    usdkrw_range: tuple[float, float] = (1100.0, 1800.0)  # sanity check that a KRW ticker is the same coin
 
 
 @dataclass
 class Settings:
     base_url: str = "https://fapi.binance.com"
+    spot_url: str = "https://data-api.binance.vision"  # Binance public market data
+    upbit_url: str = "https://api.upbit.com"
+    bithumb_url: str = "https://api.bithumb.com"
+    watch_listings: bool = True
     db_path: Path = Path("data/pumpfade.sqlite")
     start_equity: float = 10_000.0
-    margin_fraction: float = 0.15      # margin per signal as a share of the book's equity (STRATEGY.md)
+    margin_fraction: float = 0.12      # margin per signal as a share of the book's equity (STRATEGY.md)
     max_margin_used: float = 0.90      # never commit more than this share of equity as margin
     scan_delay_s: int = 60             # run the daily scan this long after 00:00 UTC (funding settles first)
     scan_deadline_s: int = 30 * 60     # a scan later than this after 00:00 UTC is skipped as stale
@@ -65,6 +74,8 @@ class Settings:
             pass
         s = cls()
         s.base_url = os.getenv("PUMPFADE_BASE_URL", s.base_url)
+        s.spot_url = os.getenv("PUMPFADE_SPOT_URL", s.spot_url)
+        s.watch_listings = os.getenv("PUMPFADE_WATCH_LISTINGS", "1") != "0"
         s.db_path = Path(os.getenv("PUMPFADE_DB", str(s.db_path)))
         s.start_equity = float(os.getenv("PUMPFADE_START_EQUITY", s.start_equity))
         s.margin_fraction = float(os.getenv("PUMPFADE_MARGIN_FRACTION", s.margin_fraction))

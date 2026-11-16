@@ -220,3 +220,90 @@ def test_banned_and_held_coins_are_skipped(setup):
     assert len(legs_of(store, "half")) == 2
     eng.open_signals([cand], DAY)  # same coin again while held
     assert len(legs_of(store, "half")) == 2
+
+
+# ---------------------------------------------------------------- listing pumps
+
+from pumpfade.listings import ListingWatcher  # noqa: E402
+
+
+class FakeVenue:
+    def __init__(self, markets, first=(None, None)):
+        self.m = set(markets)
+        self.first = first
+
+    def markets(self):
+        return set(self.m)
+
+    def first_trade(self, base):
+        return self.first
+
+
+class FakeFutures(FakeClient):
+    def __init__(self, onboard_ms):
+        super().__init__()
+        self.onboard = onboard_ms
+
+    def exchange_info(self):
+        return [{"symbol": "TGTUSDT", "contractType": "PERPETUAL", "status": "TRADING", "underlyingType": "COIN",
+                 "onboardDate": self.onboard}]
+
+
+def watcher_setup(tmp_path, onboard_days_ago=100, krw_price=1400.0):
+    fut = FakeFutures(onboard_ms=ENTRY - onboard_days_ago * DAY_MS)
+    fut.price = 1.0
+    settings = Settings(db_path=tmp_path / "l.sqlite", margin_fraction=0.10, books=(BookSpec("limit", "limit"),))
+    store = Store(settings.db_path)
+    up = FakeVenue({"BTC"})
+    w = ListingWatcher(store, fut, settings, venues={"upbit": up}, notify=lambda *a, **k: None, clock=lambda: fut.now)
+    eng = PaperEngine(fut, store, settings, notify=lambda *a, **k: None, clock=lambda: fut.now)
+    return fut, store, up, w, eng
+
+
+def test_listing_of_an_existing_perp_is_scheduled_an_hour_after_the_listing_hour(tmp_path):
+    fut, store, up, w, eng = watcher_setup(tmp_path)
+    w.poll()                                   # first poll only seeds the known markets
+    assert store.listings() == []
+    start = ENTRY + 2 * HOUR_MS + 25 * MIN     # trading opens at 02:25 UTC
+    up.m.add("TGT")
+    up.first = (start, 1400.0)                 # 1400 KRW for a $1 coin: same coin
+    fut.now = start + 5 * MIN
+    w._last_poll.clear()
+    w.poll()
+    row = store.listing("upbit", "TGT")
+    assert row["status"] == "scheduled" and row["perp"] == "TGTUSDT"
+    assert row["entry_ms"] == ENTRY + 3 * HOUR_MS
+    assert w.due(fut.now) == []
+    fut.now = row["entry_ms"] + MIN
+    assert [r["base"] for r in w.due(fut.now)] == ["TGT"]
+    eng.open_listing("TGTUSDT", "upbit", row["entry_ms"])
+    leg = store.legs()[0]
+    assert leg.sleeve == "listing" and leg.status == "open" and leg.stop_px == pytest.approx(leg.entry_px * 1.15)
+
+
+def test_new_tokens_and_ticker_clashes_are_skipped(tmp_path):
+    fut, store, up, w, eng = watcher_setup(tmp_path, onboard_days_ago=10)
+    w.poll()
+    up.m.add("TGT")
+    up.first = (fut.now, 1400.0)
+    w._last_poll.clear()
+    w.poll()
+    assert "new token" in store.listing("upbit", "TGT")["reason"]
+
+    fut, store, up, w, eng = watcher_setup(tmp_path / "b")
+    w.poll()
+    up.m.add("TGT")
+    up.first = (fut.now, 3.0)                  # 3 KRW for a $1 coin: a different coin with the same ticker
+    w._last_poll.clear()
+    w.poll()
+    assert "price mismatch" in store.listing("upbit", "TGT")["reason"]
+
+
+def test_a_listing_stop_does_not_drop_the_coin(tmp_path):
+    fut, store, up, w, eng = watcher_setup(tmp_path)
+    eng.open_listing("TGTUSDT", "upbit", fut.now)
+    fut.add_candle(fut.now // MIN * MIN + MIN, 1.0, 1.2, 1.0, 1.2)
+    fut.now += 3 * MIN
+    eng.tick()
+    assert store.legs()[0].exit_reason == "stop"
+    assert not store.is_banned("limit", "TGTUSDT")

@@ -6,12 +6,15 @@ from collections import defaultdict
 
 from .store import Store
 
-# Backtest 2024-01..2026-10 of the rule as written: limit entry, wick and funding filters (research/STRATEGY.md)
+# Backtest 2024-01..2026-10 of the rules as written (research/STRATEGY.md)
 EXPECTED = {"per_signal": 0.020, "win": 0.63, "tp": 0.34, "stop": 0.31, "time": 0.35, "limit_fill": 0.86}
+EXPECTED_LISTING = {"per_signal": 0.028, "win": 0.67}
 
 
-def book_stats(store: Store, book: str, start_equity: float) -> dict:
+def book_stats(store: Store, book: str, start_equity: float, sleeve: str | None = None) -> dict:
     legs = store.legs("book=?", (book,))
+    if sleeve:
+        legs = [lg for lg in legs if lg.sleeve == sleeve]
     closed = [lg for lg in legs if lg.status == "closed"]
     signals = defaultdict(list)
     for lg in legs:
@@ -59,13 +62,19 @@ def _r(x):
 def render(store: Store, books: list[str], start_equity: float) -> str:
     lines = ["book | equity | return | max DD | signals (closed) | per signal | win | TP/stop/time | "
              "market slip | stop slip | limit fill | funding | open"]
-    for b in books:
-        s = book_stats(store, b, start_equity)
+    for b, sleeve in [(b, sl) for b in books for sl in (None, "main", "listing")]:
+        s = book_stats(store, b, start_equity, sleeve)
+        if sleeve and not s["signals"]:
+            continue
+        label = f"{b}" if sleeve is None else f"  └ {sleeve}"
+        eq = (f"${s['equity']:,.0f} | {_p(s['return'])} | {_p(s['maxdd'])}" if sleeve is None else " | | ")
         lines.append(
-            f"{b} | ${s['equity']:,.0f} | {_p(s['return'])} | {_p(s['maxdd'])} | {s['signals']} ({s['closed_signals']}) | "
+            f"{label} | {eq} | {s['signals']} ({s['closed_signals']}) | "
             f"{_p(s['per_signal'], 2)} | {_r(s['win'])} | {_r(s['tp'])}/{_r(s['stop'])}/{_r(s['time'])} | "
             f"{_p(s['market_slip'], 2)} | {_p(s['stop_slip'], 2)} | {_r(s['limit_fill'])} | ${s['funding']:+,.2f} | {s['open']}")
     e = EXPECTED
     lines.append(f"backtest | | | | | {_p(e['per_signal'], 2)} | {_r(e['win'])} | {_r(e['tp'])}/{_r(e['stop'])}/{_r(e['time'])} "
                  f"| ≤ +0.30% assumed | | {_r(e['limit_fill'])} | | ")
+    lines.append(f"backtest listing | | | | | {_p(EXPECTED_LISTING['per_signal'], 2)} | {_r(EXPECTED_LISTING['win'])} "
+                 f"| | | | | | ")
     return "\n".join(lines)

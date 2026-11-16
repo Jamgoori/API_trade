@@ -77,6 +77,32 @@ class PaperEngine:
                 notes.append(f"{spec.name}: short {c.symbol} margin ${margin:,.0f}")
         return notes
 
+    def open_listing(self, symbol: str, venue: str, entry_ms: int) -> list[str]:
+        """Rule 2: short the perp at market (IOC within the slippage cap) in every book that does not hold it."""
+        now = self.clock()
+        day = entry_ms // DAY_MS - 1
+        notes, snapshot = [], None
+        for spec in self.settings.books:
+            active = [lg for lg in self.store.active_legs() if lg.book == spec.name]
+            if any(lg.symbol == symbol for lg in active):
+                self.store.log_skip(day, spec.name, symbol, f"listing on {venue}: already holding this coin")
+                continue
+            equity = self.store.book_equity(spec.name, self.settings.start_equity)
+            margin = equity * self.settings.margin_fraction
+            if sum(lg.notional for lg in active) + margin > self.settings.max_margin_used * equity * (1 + 1e-9):
+                self.store.log_skip(day, spec.name, symbol, f"listing on {venue}: margin limit reached")
+                continue
+            if snapshot is None:
+                snapshot = self.client.depth(symbol)
+            bids, asks = snapshot
+            leg = Leg(book=spec.name, symbol=symbol, signal_day=day, part="L", kind="market", status="pending",
+                      margin=margin, notional=margin, ref_px=(bids[0][0] + asks[0][0]) / 2,
+                      hold_hours=spec.hold_hours, sleeve="listing")
+            self._enter_market(leg, now, snapshot)
+            self.store.save_leg(leg)
+            notes.append(f"{spec.name}: short {symbol} after {venue} listing, margin ${margin:,.0f}")
+        return notes
+
     def _hour_open(self, symbol: str, entry_ms: int) -> float:
         rows = self.client.klines(symbol, "1h", start_ms=entry_ms, limit=1)
         if rows and int(rows[0][0]) == entry_ms:
@@ -226,7 +252,7 @@ class PaperEngine:
         leg.pnl = leg.qty * (leg.entry_px - px) - leg.fees + leg.funding
         leg.status = "closed"
         equity = self.store.add_pnl(leg.book, leg.pnl, ms)
-        if reason == "stop":
+        if reason == "stop" and leg.sleeve == "main":  # listing trades never drop a coin
             self.store.ban(leg.book, leg.symbol, leg.signal_day)
-        self.notify(f"[{leg.book}] {leg.symbol} {leg.part} closed by {reason}: "
+        self.notify(f"[{leg.book}/{leg.sleeve}] {leg.symbol} {leg.part} closed by {reason}: "
                     f"{leg.entry_px:.6g} → {px:.6g}, PnL ${leg.pnl:+,.2f} (book ${equity:,.0f})")

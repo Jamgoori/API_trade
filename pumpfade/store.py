@@ -23,6 +23,7 @@ class Leg:
     notional: float            # target notional of this leg
     ref_px: float              # 00:00 UTC open of the hour (what the backtest enters at)
     hold_hours: int
+    sleeve: str = "main"       # "main" (daily +20% rule) or "listing" (listing pump)
     limit_px: float | None = None
     limit_until_ms: int | None = None
     qty: float = 0.0
@@ -63,7 +64,14 @@ class Store:
                                                 PRIMARY KEY (day, symbol));
             CREATE TABLE IF NOT EXISTS skips (day INTEGER, book TEXT, symbol TEXT, reason TEXT);
             CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
+            CREATE TABLE IF NOT EXISTS listings (venue TEXT, base TEXT, perp TEXT, detected_ms INTEGER,
+                                                 start_ms INTEGER, entry_ms INTEGER, status TEXT, reason TEXT,
+                                                 PRIMARY KEY (venue, base));
         """)
+        have = {r["name"] for r in self.db.execute("PRAGMA table_info(legs)").fetchall()}
+        for name in LEG_FIELDS:
+            if name not in have:  # databases created by an older version
+                self.db.execute(f"ALTER TABLE legs ADD COLUMN {name}")
         self.db.commit()
 
     # key/value
@@ -136,6 +144,22 @@ class Store:
     def log_skip(self, day: int, book: str, symbol: str, reason: str) -> None:
         self.db.execute("INSERT INTO skips (day, book, symbol, reason) VALUES (?, ?, ?, ?)", (day, book, symbol, reason))
         self.db.commit()
+
+    def listing(self, venue: str, base: str) -> dict | None:
+        row = self.db.execute("SELECT * FROM listings WHERE venue=? AND base=?", (venue, base)).fetchone()
+        return dict(row) if row else None
+
+    def save_listing(self, row: dict) -> None:
+        cols = ["venue", "base", "perp", "detected_ms", "start_ms", "entry_ms", "status", "reason"]
+        self.db.execute(f"INSERT OR REPLACE INTO listings ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                        [row.get(c) for c in cols])
+        self.db.commit()
+
+    def listings(self, status: str | None = None) -> list[dict]:
+        q, args = "SELECT * FROM listings", ()
+        if status:
+            q, args = q + " WHERE status=?", (status,)
+        return [dict(r) for r in self.db.execute(q + " ORDER BY detected_ms", args).fetchall()]
 
     def equity_log(self, book: str) -> list[tuple[int, float]]:
         return [(r["ts"], r["equity"]) for r in

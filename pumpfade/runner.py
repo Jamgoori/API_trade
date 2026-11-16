@@ -10,7 +10,8 @@ from hedgebot.notifier import Notifier
 
 from .binance import BinancePublic
 from .config import Settings
-from .paper import PaperEngine
+from .listings import ListingWatcher
+from .paper import LATE_MS, PaperEngine
 from .report import render
 from .signals import DAY_MS, HOUR_MS, run_scan
 from .store import Store
@@ -25,13 +26,17 @@ def kst(day: int) -> str:
 
 
 class Runner:
-    def __init__(self, settings: Settings, client=None, store: Store | None = None, notifier=None, clock=None):
+    def __init__(self, settings: Settings, client=None, store: Store | None = None, notifier=None, clock=None,
+                 listing_venues: dict | None = None):
         self.settings = settings
         self.client = client or BinancePublic(settings.base_url)
         self.store = store or Store(settings.db_path)
         self.notifier = notifier or Notifier(settings.telegram_token, settings.telegram_chat, prefix="[pumpfade] ")
         self.clock = clock or (lambda: int(time.time() * 1000))
         self.engine = PaperEngine(self.client, self.store, settings, notify=self.notifier.send, clock=self.clock)
+        self.watcher = (ListingWatcher(self.store, self.client, settings, venues=listing_venues,
+                                       notify=self.notifier.send, clock=self.clock)
+                        if settings.watch_listings else None)
         for b in settings.books:
             self.store.book_equity(b.name, settings.start_equity)
 
@@ -67,6 +72,20 @@ class Runner:
             else:
                 self.notifier.send(f"missed the {kst(target)} 09:00 KST scan (bot was not running)", level="warning")
             self.store.put("last_scan_day", target)
+        if self.watcher is not None:
+            try:
+                self.watcher.poll()
+                for row in self.watcher.due(now):
+                    if now - row["entry_ms"] <= LATE_MS:
+                        notes = self.engine.open_listing(row["perp"], row["venue"], row["entry_ms"])
+                        row["status"] = "entered"
+                        self.notifier.send("\n".join([f"listing short {row['perp']} ({row['venue']})"] + notes))
+                    else:
+                        row.update(status="skipped", reason="the bot was not running at the entry time")
+                    self.store.save_listing(row)
+            except Exception as exc:
+                log.exception("listing watcher failed")
+                self.notifier.send(f"listing watcher failed: {exc}", level="warning", key="listings", throttle_s=3600)
         self.engine.tick()
         if now - (self.store.get("funding_ms") or 0) >= HOUR_MS:
             self.engine.settle_all_funding()
