@@ -21,9 +21,10 @@ dev = ["pytest>=8"]
 
 [project.scripts]
 hedgebot = "hedgebot.cli:main"
+pumpfade = "pumpfade.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["hedgebot*"]
+include = ["hedgebot*", "pumpfade*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
