@@ -42,7 +42,7 @@ class Settings:
     base_url: str = "https://fapi.binance.com"
     db_path: Path = Path("data/pumpfade.sqlite")
     start_equity: float = 10_000.0
-    margin_fraction: float = 0.10      # margin per signal as a share of the book's equity
+    margin_fraction: float = 0.15      # margin per signal as a share of the book's equity (STRATEGY.md)
     max_margin_used: float = 0.90      # never commit more than this share of equity as margin
     scan_delay_s: int = 60             # run the daily scan this long after 00:00 UTC (funding settles first)
     scan_deadline_s: int = 30 * 60     # a scan later than this after 00:00 UTC is skipped as stale

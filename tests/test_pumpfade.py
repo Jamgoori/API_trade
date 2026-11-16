@@ -136,7 +136,7 @@ class FakeClient:
 @pytest.fixture
 def setup(tmp_path):
     client = FakeClient()
-    settings = Settings(db_path=tmp_path / "p.sqlite",
+    settings = Settings(db_path=tmp_path / "p.sqlite", margin_fraction=0.10,
                         books=(BookSpec("market", "market"), BookSpec("limit", "limit"), BookSpec("half", "half")))
     store = Store(settings.db_path)
     eng = PaperEngine(client, store, settings, notify=lambda *a, **k: None, clock=lambda: client.now)

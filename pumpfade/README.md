@@ -25,7 +25,7 @@
 | `half` | 절반 시장가 + 절반 지정가 (비교용) | 48시간 |
 | `limit_3d` | limit과 같음 (비교용) | 72시간 |
 
-장부마다 1만 달러로 시작하고, 신호 하나에 그 장부 자본의 10%를 써요. 손절한 코인은 장부마다 따로 제외 목록에 넣어요.
+장부마다 1만 달러로 시작하고, 신호 하나에 그 장부 자본의 15%를 써요(동시에 최대 6개). 손절한 코인은 장부마다 따로 제외 목록에 넣어요.
 
 ## 실행 방법
 
@@ -98,7 +98,7 @@ python -m pumpfade status
 - 지정가 체결률이 **75~80% 이상**이어야 해요.
 - 빠진 날이나 오류가 없어야 해요.
 
-통과하면 테스트넷을 거쳐 실거래 5%로 넘어가요. 단계는 `research/STRATEGY.md`의 크기 표를 따라요.
+통과하면 테스트넷을 거쳐 실거래 5%로 시작하고, 조건을 채우면 15%로 올려요. 자세한 단계는 `research/STRATEGY.md`의 크기 표를 따라요.
 기본은 `limit` 장부예요. `market`, `half` 장부는 실제 슬리피지가 아주 작게 나올 때 다시 비교해보려고 남겨둔 거예요.
 
 ## 설정
@@ -108,7 +108,7 @@ python -m pumpfade status
 | 변수 | 기본값 | 내용 |
 |---|---|---|
 | `PUMPFADE_START_EQUITY` | 10000 | 장부별 시작 자본 |
-| `PUMPFADE_MARGIN_FRACTION` | 0.10 | 신호당 증거금 비율 |
+| `PUMPFADE_MARGIN_FRACTION` | 0.15 | 신호당 증거금 비율 |
 | `PUMPFADE_DB` | data/pumpfade.sqlite | 기록 파일 |
 | `PUMPFADE_BASE_URL` | https://fapi.binance.com | 바이낸스 선물 API 주소 |
 

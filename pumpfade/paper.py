@@ -57,7 +57,7 @@ class PaperEngine:
                 equity = self.store.book_equity(spec.name, self.settings.start_equity)
                 margin = equity * self.settings.margin_fraction
                 used = sum(lg.notional for lg in active)
-                if used + margin > self.settings.max_margin_used * equity:
+                if used + margin > self.settings.max_margin_used * equity * (1 + 1e-9):  # 6 × 15% must fit in 90%
                     self.store.log_skip(day, spec.name, c.symbol, "margin limit reached")
                     continue
                 parts = {"market": [("A", "market", 1.0)], "limit": [("B", "limit", 1.0)],
