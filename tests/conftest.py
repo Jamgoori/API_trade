@@ -104,6 +104,7 @@ class FakeContext:
         self.budget_ok = True
         self.funding: dict[tuple[str, str], Decimal] = {}
         self.scale: tuple[Decimal, int] = (Decimal(1), 0)
+        self.groups: dict = {}
 
     def account(self, venue, max_age_s=5.0) -> AccountState:
         return self.venues[venue].account()
@@ -125,6 +126,15 @@ class FakeContext:
 
     def maker_venue_bias(self, pair, venue):
         return ZERO
+
+    def _side(self, pair):
+        return next(p.group_side for p in self.cfg.pairs if p.name == pair)
+
+    def group_direction(self, pair):
+        return self.groups.get("dir", 1) * self._side(pair)
+
+    def group_rotation(self, pair):
+        return self.group_direction(pair)
 
     def size_scale(self):
         return self.scale

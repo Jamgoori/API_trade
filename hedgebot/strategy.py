@@ -49,6 +49,28 @@ def should_flip(direction: int, f_maker_1h: Decimal, f_hedge_1h: Decimal, flip_a
     return (-current) - current >= flip_apr
 
 
+def group_carry_apr(members: list[tuple[int, Decimal, Decimal, Decimal]]) -> Decimal:
+    """Funding earned per $1 of a direction group's notional when the group points +1.
+
+    members: (group_side, maker notional, maker funding 1h, hedge funding 1h); with the group at +1
+    each pair's maker direction is its group_side.
+    """
+    total = sum((D(n) for _, n, _, _ in members), D(0))
+    if total <= 0:
+        return D(0)
+    return sum((D(n) * carry_apr(side, fm, fh) for side, n, fm, fh in members), D(0)) / total
+
+
+def choose_group_direction(edge_apr: Decimal, min_edge_apr: Decimal) -> int:
+    """+1 / -1 for a fresh group: the funding-earning way when the edge is meaningful, else +1."""
+    return -1 if edge_apr <= -min_edge_apr else 1
+
+
+def should_flip_group(direction: int, edge_apr: Decimal, flip_apr: Decimal) -> bool:
+    current = direction * D(edge_apr)
+    return -current - current >= flip_apr
+
+
 def basis_bps(maker_price: Decimal, hedge_price: Decimal) -> Decimal:
     return bps(D(maker_price), D(hedge_price))
 

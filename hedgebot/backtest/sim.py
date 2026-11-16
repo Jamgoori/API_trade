@@ -21,6 +21,8 @@ import math
 import random
 from dataclasses import dataclass, field
 
+from decimal import Decimal
+
 from .. import strategy
 from ..marketcal import is_arcus_off_hours
 from .data import PairData
@@ -334,6 +336,14 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
     venue_volume = {v: 0.0 for v in venues}
     venue_oi_hours = {v: 0.0 for v in venues}
     dd = {"peak": sum(equity.values()), "usd": 0.0, "pct": 0.0}
+    group_dir: dict[str, int] = {}
+
+    def group_edge(group: str, t: int) -> Decimal:
+        members = [(q.cfg.group_side, Decimal(str(q.notional)),
+                    Decimal(str(_trailing_avg(q.data.maker_funding, t, fwin))),
+                    Decimal(str(_trailing_avg(q.data.hedge_funding, t, fwin))))
+                   for q in pairs if q.cfg.direction_group == group]
+        return strategy.group_carry_apr(members)
 
     def legs_on(venue: str):
         """(pair, signed size, spec, is_maker) for every open leg on a venue."""
@@ -685,9 +695,17 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
 
             if p.direction == 0:
                 p.reset_ratio(mc, hc)
-                p.direction = strategy.choose_direction(
-                    p.cfg.direction, _trailing_avg(p.data.maker_funding, t, fwin), _trailing_avg(p.data.hedge_funding, t, fwin),
-                    params.min_carry_edge_apr, venue_bias.get(p.mv, 0.0))
+                g = p.cfg.direction_group
+                if g:
+                    if g not in group_dir:
+                        group_dir[g] = strategy.choose_group_direction(group_edge(g, t),
+                                                                       Decimal(str(params.min_carry_edge_apr)))
+                    p.direction = group_dir[g] * p.cfg.group_side
+                else:
+                    p.direction = strategy.choose_direction(
+                        p.cfg.direction, _trailing_avg(p.data.maker_funding, t, fwin),
+                        _trailing_avg(p.data.hedge_funding, t, fwin), params.min_carry_edge_apr,
+                        venue_bias.get(p.mv, 0.0))
                 p.target = p.direction * p.notional / mc
                 p.res.direction_changes.append((t, p.direction))
             venue_bias[p.mv] = venue_bias.get(p.mv, 0.0) + p.direction * p.notional
@@ -727,9 +745,20 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
                 if day_cost.get(day, 0.0) >= params.max_daily_cost_usd:
                     p.next_rot = t + HOUR_MS // 2
                     continue
-                flip = p.cfg.direction == "auto" and strategy.should_flip(
-                    p.direction, _trailing_avg(p.data.maker_funding, t, fwin), _trailing_avg(p.data.hedge_funding, t, fwin),
-                    params.flip_carry_apr)
+                g = p.cfg.direction_group
+                if g:
+                    o = group_dir.get(g) or p.direction * p.cfg.group_side
+                    if strategy.should_flip_group(o, group_edge(g, t), Decimal(str(params.flip_carry_apr))):
+                        o = -o
+                        for q in pairs:  # the rest of the group follows right away
+                            if q is not p and q.cfg.direction_group == g and q.phase == "hold":
+                                q.next_rot = min(q.next_rot, t)
+                    group_dir[g] = o
+                    flip = o * p.cfg.group_side != p.direction
+                else:
+                    flip = p.cfg.direction == "auto" and strategy.should_flip(
+                        p.direction, _trailing_avg(p.data.maker_funding, t, fwin),
+                        _trailing_avg(p.data.hedge_funding, t, fwin), params.flip_carry_apr)
                 frac = 1.0 if flip else rng.uniform(p.frac_min, p.frac_max)
                 if not guard_ok(-1 if p.qty > 0 else 1):
                     p.next_rot = t + HOUR_MS // 4

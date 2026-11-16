@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
+from . import strategy
 from .backstop import BackstopManager
 from .config import Config, Secrets
 from .executor import PairExecutor
@@ -28,6 +29,7 @@ from .venues.paper import PaperVenue
 log = logging.getLogger(__name__)
 
 DRAWDOWN_STOP_KEY = "__drawdown_stop__"
+GROUPS_KEY = "__groups__"
 
 HL_MODE_HELP = ("Hyperliquid account {address} is in '{mode}' mode. The bot needs Standard mode "
                 "(separate trade.xyz / Entropy balances): switch it in the Hyperliquid app or run "
@@ -88,6 +90,7 @@ class Engine:
         self._funding_cache: dict[tuple[str, str], tuple[float, Decimal]] = {}
         self._timers: dict[str, float] = {}
         self.rng = random.Random(cfg.strategy.seed)
+        self._group_dir: dict[str, int] = {k: int(v) for k, v in (self.journal.load_pair_state(GROUPS_KEY) or {}).items()}
         saved = self.journal.load_pair_state("__sizing__") or {}
         self.scaler = SizeScaler(cfg.sizing, D(saved.get("scale", 1)), int(saved.get("version", 0)), bool(saved))
         if not cfg.sizing.scale_with_equity and self.scaler.scale != 1:
@@ -162,6 +165,54 @@ class Engine:
             if ex.name != pair and ex.pair.maker.venue == venue and ex.rt.direction:
                 bias += ex.rt.direction * ex.pair.notional_usd
         return bias
+
+    # ------------------------------------------------------- direction groups
+    def _group_members(self, group: str) -> list[PairExecutor]:
+        return [ex for ex in self.executors if ex.pair.direction_group == group]
+
+    def _group_edge(self, group: str) -> Decimal:
+        members = [(ex.pair.group_side, ex.pair.notional_usd,
+                    self.funding_avg(ex.pair.maker.venue, ex.pair.maker.symbol),
+                    self.funding_avg(ex.pair.hedge.venue, ex.pair.hedge.symbol)) for ex in self._group_members(group)]
+        return strategy.group_carry_apr(members)
+
+    def _set_group(self, group: str, direction: int) -> None:
+        self._group_dir[group] = direction
+        self.journal.save_pair_state(GROUPS_KEY, dict(self._group_dir))
+
+    def _group_of(self, pair: str) -> tuple[str, int]:
+        ex = next(e for e in self.executors if e.name == pair)
+        return ex.pair.direction_group, ex.pair.group_side
+
+    def group_direction(self, pair: str) -> int:
+        """Maker direction for a pair of a direction group (the group's direction x the pair's side)."""
+        group, side = self._group_of(pair)
+        direction = self._group_dir.get(group)
+        if not direction:
+            # a member already holding a position (state lost) defines the group; otherwise funding does
+            held = [ex.rt.direction * ex.pair.group_side for ex in self._group_members(group) if ex.rt.direction]
+            direction = held[0] if held else strategy.choose_group_direction(
+                self._group_edge(group), self.cfg.strategy.min_carry_edge_apr)
+            self._set_group(group, direction)
+            self.event("info", "group", f"group {group}: direction {direction:+d}")
+        return direction * side
+
+    def group_rotation(self, pair: str) -> int:
+        """At a member's rotation: turn the whole group when the other way earns `flip_carry_apr` more."""
+        group, side = self._group_of(pair)
+        current = self.group_direction(pair) * side
+        edge = self._group_edge(group)
+        if strategy.should_flip_group(current, edge, self.cfg.strategy.flip_carry_apr):
+            current = -current
+            self._set_group(group, current)
+            self.event("info", "group", f"group {group}: turning to {current:+d} (funding {current * edge:+.1%}/yr)",
+                       notify=True)
+            now = time.time()
+            for ex in self._group_members(group):  # the others follow right away, not at their next rotation
+                if ex.name != pair and ex.rt.phase == "hold" and ex.rt.next_rotation_ts > now:
+                    ex.rt.next_rotation_ts = now
+                    ex.persist()
+        return current * side
 
     def journal_fill(self, **kwargs) -> None:
         self.journal.fill(**kwargs)

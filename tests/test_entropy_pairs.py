@@ -36,15 +36,21 @@ def write(tmp_path, text):
     return p
 
 
-def test_example_config_is_entropy_only():
+def test_example_config_hedges_entropy_on_trade_xyz():
     cfg = load_config("config.example.yaml")
-    assert cfg.venues_needed() == ["hl:io"]
-    assert all(p.hedge_notional_ratio for p in cfg.pairs)
+    assert cfg.venues_needed() == ["hl:io", "hl:xyz"]
+    for p in cfg.pairs:  # the same stock on both venues, Entropy as the maker
+        assert (p.maker.venue, p.hedge.venue) == ("hl:io", "hl:xyz")
+        assert p.maker.symbol.split(":")[1] == p.hedge.symbol.split(":")[1] and p.hedge_notional_ratio is None
     symbols = [leg.symbol for p in cfg.pairs for leg in (p.maker, p.hedge)]
     assert len(symbols) == len(set(symbols))  # a market in two pairs would net the positions on the venue
+    groups = {}
+    for p in cfg.pairs:
+        groups.setdefault(p.direction_group, []).append(p.group_side)
+    assert all(sorted(sides) == [-1, 1] for sides in groups.values())  # every venue long one, short the other
     assert cfg.strategy.rotate_when == "us_session" and cfg.strategy.rotation_fraction_min == 1
     assert cfg.risk.max_drawdown_pct > cfg.risk.drawdown_warn_pct > 0
-    assert not cfg.rebalance.enabled
+    assert cfg.rebalance.enabled and set(cfg.rebalance.venues) == {"hl:io", "hl:xyz"}
 
 
 def test_two_markets_on_one_venue_need_a_notional_ratio(tmp_path):
@@ -301,3 +307,118 @@ def test_pair_stats_suggests_the_volatility_ratio():
     assert st.correlation > 0.99
     assert st.suggested_ratio == pytest.approx(2.0, rel=0.05)
     assert st.book_vol_suggested < st.book_vol
+
+
+# --------------------------------------------------------- direction groups
+def test_group_carry_and_flip_rules():
+    h = Dd(1) / Dd(8760)  # 1%/yr expressed as an hourly rate, per 1% below
+    # side +1 pair: Entropy longs pay 12%/yr more than trade.xyz longs -> long maker loses 12%
+    # side -1 pair: Entropy longs pay 6% more -> short maker earns 6%
+    members = [(1, Dd(1000), Dd("0.12") * h, Dd(0)), (-1, Dd(1000), Dd("0.06") * h, Dd(0))]
+    edge = strategy.group_carry_apr(members)
+    assert edge == pytest.approx(Dd("-0.03"), abs=Dd("0.0001"))  # (-12% + 6%) / 2
+    assert strategy.choose_group_direction(edge, Dd("0.02")) == -1
+    assert strategy.choose_group_direction(Dd("0.01"), Dd("0.02")) == 1
+    assert strategy.should_flip_group(1, edge, Dd("0.02"))  # +1 earns -3%, -1 earns +3%: 6% better
+    assert not strategy.should_flip_group(-1, edge, Dd("0.02"))
+
+
+def test_grouped_pairs_need_auto_direction(tmp_path):
+    base = ('{name: A, maker: {venue: "hl:io", symbol: "io:A"}, hedge: {venue: "hl:xyz", symbol: "xyz:A"}, '
+            'notional_usd: 100, direction_group: g')
+    with pytest.raises(ConfigError, match="direction_group"):
+        load_config(write(tmp_path, f"pairs:\n  - {base}, direction: long_maker}}\n"))
+    with pytest.raises(ConfigError, match="direction_group"):
+        load_config(write(tmp_path, f"pairs:\n  - {base}, group_side: 2}}\n"))
+
+
+@pytest.fixture
+def group_engine(tmp_path, monkeypatch):
+    def build(f_a_io=Dd(0), f_b_io=Dd(0)):
+        cfg = make_config()
+        cfg.capital = {"hl:io": D(9000), "hl:xyz": D(9000)}
+        cfg.journal_path = str(tmp_path / "j.sqlite")
+        cfg.paper.state_dir = str(tmp_path / "paper")
+        cfg.rebalance.enabled = False
+        cfg.strategy.min_carry_edge_apr = Dd("0.02")
+        cfg.strategy.flip_carry_apr = Dd("0.02")
+        cfg.pairs = [
+            PairConfig("A", LegConfig("hl:io", "io:A"), LegConfig("hl:xyz", "xyz:A"), D(2000), 5, "auto",
+                       direction_group="g", group_side=1),
+            PairConfig("B", LegConfig("hl:io", "io:B"), LegConfig("hl:xyz", "xyz:B"), D(2000), 5, "auto",
+                       direction_group="g", group_side=-1),
+        ]
+        mk = lambda v, s, f=Dd(0): make_market(v, s, funding_rate_1h=f, outside_rth=False)  # noqa: E731
+        data = {
+            "hl:io": FakeDataVenue("hl:io", {"io:A": mk("hl:io", "io:A", f_a_io), "io:B": mk("hl:io", "io:B", f_b_io)}),
+            "hl:xyz": FakeDataVenue("hl:xyz", {"xyz:A": mk("hl:xyz", "xyz:A"), "xyz:B": mk("hl:xyz", "xyz:B")}),
+        }
+        monkeypatch.setattr(engine_mod, "build_market_venues", lambda c, s, trading: data)
+        eng = Engine(cfg, Secrets(), journal=Journal(cfg.journal_path))
+        for v in eng.venues.values():
+            v.bbo_cache_s = 0
+        eng.setup()
+        return eng, data
+    return build
+
+
+def test_group_members_take_opposite_sides_and_follow_funding(group_engine):
+    h = Dd(1) / Dd(8760)
+    # Entropy longs of A pay 10%/yr, of B 6%/yr more than on trade.xyz: shorting A / buying B on Entropy earns
+    eng, data = group_engine(f_a_io=Dd("0.10") * h, f_b_io=Dd("0.06") * h)
+    assert eng.group_direction("A") == -1 and eng.group_direction("B") == 1
+    assert eng.journal.load_pair_state("__groups__") == {"g": -1}
+    restarted = Engine(eng.cfg, Secrets(), journal=Journal(eng.cfg.journal_path))
+    assert restarted._group_dir == {"g": -1}
+
+
+def test_group_turns_together_when_funding_reverses(group_engine):
+    eng, data = group_engine()
+    assert eng.group_direction("A") == 1  # no edge: +1
+    ex_b = next(ex for ex in eng.executors if ex.name == "B")
+    ex_b.rt.direction, ex_b.rt.phase, ex_b.rt.next_rotation_ts = -1, "hold", time.time() + 50 * 3600
+    h = Dd(1) / Dd(8760)
+    data["hl:io"].markets["io:A"] = make_market("hl:io", "io:A", funding_rate_1h=Dd("0.10") * h, outside_rth=False)
+    eng._funding_cache.clear()
+    assert eng.group_rotation("A") == -1  # A's rotation turns the whole group
+    assert eng._group_dir["g"] == -1
+    assert ex_b.rt.next_rotation_ts <= time.time()  # B rotates right away instead of in 50h
+    assert eng.group_rotation("B") == 1  # B's own rotation now turns it to the group's side
+
+
+def test_executor_takes_its_direction_from_the_group(io_pair):
+    cfg, ctx, venue, data = io_pair()
+    cfg.pairs[0].direction, cfg.pairs[0].direction_group, cfg.pairs[0].group_side = "auto", "g", -1
+    ctx.groups["dir"] = 1
+    ex = PairExecutor(cfg.pairs[0], ctx, random.Random(1))
+    ex.step(time.time())
+    assert ex.rt.direction == -1 and Dd(ex.rt.target_qty) < 0
+
+
+def test_backtest_group_keeps_each_venue_long_and_short():
+    step = 3_600_000
+    start = ms(2026, 11, 16, 0, 0)
+    n = 24 * 6
+    t = [start + i * step for i in range(n)]
+
+    def series(px):
+        return Series(t, [px] * n, [px * 1.001] * n, [px * 0.999] * n, [px] * n, [0.0] * n)
+
+    hours = [(start // step + i) * step for i in range(n)]
+    datas = []
+    for name, side, f_io in (("A", 1, 0.0), ("B", -1, 0.00001)):  # Entropy longs of B pay ~8.8%/yr extra
+        pair = PairConfig(name, LegConfig("hl:io", f"io:{name}"), LegConfig("hl:xyz", f"xyz:{name}"), Dd(5000), 5,
+                          "auto", direction_group="g", group_side=side)
+        datas.append(PairData(pair, step, series(100.0), series(100.0), [(x, f_io) for x in hours],
+                              [(x, 0.0) for x in hours]))
+    specs = {}
+    for name in ("A", "B"):
+        specs[("hl:io", f"io:{name}")] = LegSpec("hl:io", 0.00003, 0.00009, 0.02, 25, 25, False, 2.0, 3.0)
+        specs[("hl:xyz", f"xyz:{name}")] = LegSpec("hl:xyz", 0.00003, 0.00009, 0.02, 20, 20, False, 0.3, 0.5)
+    res = run_backtest(datas, BacktestParams(capital={"hl:io": 9000.0, "hl:xyz": 9000.0}, leg_specs=specs, seed=1,
+                                             min_hold_h=1e6, max_hold_h=1e6, min_carry_edge_apr=0.02),
+                       t[0], t[-1])
+    a, b = res.pairs["A"], res.pairs["B"]
+    assert a.direction_changes[0][1] == 1 and b.direction_changes[0][1] == -1  # group +1: short B on Entropy
+    assert a.final_qty > 0 > b.final_qty
+    assert res.funding > 0

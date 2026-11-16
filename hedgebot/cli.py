@@ -225,25 +225,47 @@ def cmd_pairs(args) -> int:
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - int((max(args.windows) + 2) * 86_400_000)
     proxies = _proxy_venues(args.price_proxy, cfg)
-    print(f"{'pair':<10}{'window':>7}{'corr':>7}{'maker vol':>11}{'hedge vol':>11}{'ratio now':>10}"
-          f"{'suggested':>10}{'book vol now':>14}{'suggested':>11}")
-    for pair in cfg.pairs:
-        if not pair.enabled:
-            continue
+    header = (f"{'':<22}{'window':>7}{'corr':>7}{'vol A':>8}{'vol B':>8}{'ratio now':>10}{'suggested':>10}"
+              f"{'book vol now':>14}{'suggested':>11}")
+
+    def rows(label: str, a: dict, b: dict, ratio: float) -> None:
+        for days in args.windows:
+            st = pair_stats(a, b, ratio, days)
+            if st is None:
+                print(f"{label:<22}{days:>6}d  not enough history")
+                continue
+            print(f"{label:<22}{st.days:>6}d{st.correlation:>7.2f}{st.maker_vol:>8.0%}{st.hedge_vol:>8.0%}"
+                  f"{ratio:>10.2f}{st.suggested_ratio:>10.2f}{st.book_vol:>14.1%}{st.book_vol_suggested:>11.1%}")
+
+    enabled = [p for p in cfg.pairs if p.enabled]
+    closes: dict[str, dict] = {}
+    print("Pairs: A = maker leg, B = hedge leg (ratio = B $ per A $)")
+    print(header)
+    for pair in enabled:
         data = load_pair_data(pair, venues, "1h", INTERVAL_MS["1h"], start_ms, end_ms, args.cache_dir, proxies)
         maker, hedge = daily_closes(data.maker.t, data.maker.close), daily_closes(data.hedge.t, data.hedge.close)
-        ratio = float(pair.hedge_notional_ratio or pair.hedge_ratio)
-        for days in args.windows:
-            st = pair_stats(maker, hedge, ratio, days)
-            if st is None:
-                print(f"{pair.name:<10}{days:>6}d  not enough history")
+        closes[pair.name] = maker
+        rows(f"{pair.name}", maker, hedge, float(pair.hedge_notional_ratio or pair.hedge_ratio))
+    groups: dict[str, list] = {}
+    for pair in enabled:
+        if pair.direction_group:
+            groups.setdefault(pair.direction_group, []).append(pair)
+    if groups:
+        print("\nDirection groups: A = group_side +1, B = group_side -1 (ratio = B notional per A notional)")
+        print(header)
+        for name, members in groups.items():
+            plus = [p for p in members if p.group_side == 1]
+            minus = [p for p in members if p.group_side == -1]
+            if len(plus) != 1 or len(minus) != 1:
+                print(f"{name:<22}  needs exactly one +1 and one -1 pair to be checked")
                 continue
-            print(f"{pair.name:<10}{st.days:>6}d{st.correlation:>7.2f}{st.maker_vol:>11.0%}{st.hedge_vol:>11.0%}"
-                  f"{ratio:>10.2f}{st.suggested_ratio:>10.2f}{st.book_vol:>14.1%}{st.book_vol_suggested:>11.1%}")
-    print("\nratio = hedge $ per maker $ (hedge_notional_ratio). suggested = maker vol / hedge vol.\n"
-          "book vol = yearly swing of the hedged pair per $1 of gross notional (lower is a better hedge).\n"
-          "Change hedge_notional_ratio when the 60-90 day suggestion stays >15% away from it; the bot uses\n"
-          "the new value from the next full rotation. Correlation below ~0.8 means the pair hedges poorly.")
+            a, b = plus[0], minus[0]
+            rows(f"{name} {a.name}/{b.name}", closes[a.name], closes[b.name], float(b.notional_usd / a.notional_usd))
+    print("\nsuggested = vol A / vol B (equal dollar moves on both sides). book vol = yearly swing per $1 of gross\n"
+          "notional of A long + B short at that ratio (for a group: how far one venue's balance drifts from the\n"
+          "other's). Same-stock pairs should show corr ~1.00 and a book vol of a few %.\n"
+          "Change notional_usd (groups) or hedge_notional_ratio when the 60-90 day suggestion stays >15% away;\n"
+          "the new sizes apply from the next full rotation. Correlation below ~0.8 means a poor hedge.")
     return 0
 
 

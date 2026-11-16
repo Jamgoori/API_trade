@@ -61,6 +61,8 @@ class Context(Protocol):
     def rotation_budget_left(self) -> bool: ...
     def funding_avg(self, venue: str, symbol: str) -> Decimal: ...
     def maker_venue_bias(self, pair: str, venue: str) -> Decimal: ...
+    def group_direction(self, pair: str) -> int: ...
+    def group_rotation(self, pair: str) -> int: ...
     def size_scale(self) -> tuple[Decimal, int]: ...
     def journal_fill(self, **kwargs) -> None: ...
     def journal_order(self, venue: str, pair: str, purpose: str, order: OrderState) -> None: ...
@@ -334,6 +336,8 @@ class PairExecutor:
         if self.rt.direction == 0:
             if pos != 0:
                 self.rt.direction = 1 if pos > 0 else -1
+            elif self.pair.direction_group:
+                self.rt.direction = self.ctx.group_direction(self.name)
             else:
                 self.rt.direction = strategy.choose_direction(
                     self.pair.direction,
@@ -396,12 +400,15 @@ class PairExecutor:
                                pair=self.name, throttle_key="budget", throttle_s=3600)
                 self.persist()
                 return None
-            flip = self.pair.direction == "auto" and strategy.should_flip(
-                self.rt.direction,
-                self.ctx.funding_avg(self.pair.maker.venue, self.pair.maker.symbol),
-                self.ctx.funding_avg(self.pair.hedge.venue, self.pair.hedge.symbol),
-                s.flip_carry_apr,
-            )
+            if self.pair.direction_group:  # the group decides; a member that is off it turns at its rotation
+                flip = self.ctx.group_rotation(self.name) != self.rt.direction
+            else:
+                flip = self.pair.direction == "auto" and strategy.should_flip(
+                    self.rt.direction,
+                    self.ctx.funding_avg(self.pair.maker.venue, self.pair.maker.symbol),
+                    self.ctx.funding_avg(self.pair.hedge.venue, self.pair.hedge.symbol),
+                    s.flip_carry_apr,
+                )
             fraction = D(1) if flip else strategy.rotation_fraction(self.rotation.fraction_min,
                                                                   self.rotation.fraction_max, self.rng)
             unwind_to = self.maker.round_size(self.pair.maker.symbol, abs(pos) * (1 - fraction)) * (1 if pos > 0 else -1)

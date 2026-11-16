@@ -38,6 +38,12 @@ class PairConfig:
     # usually the volatility ratio. The quantity ratio is fixed from prices whenever the pair builds from flat
     # and replaces hedge_ratio. The cross-venue basis guard does not apply to such pairs.
     hedge_notional_ratio: Decimal | None = None
+    # Pairs sharing a direction_group turn together: the maker leg of each is long when the group points +1
+    # and group_side is +1 (short when -1). Used to keep each venue's book long one stock and short a correlated
+    # one (e.g. Entropy long SNDK / short DRAM, trade.xyz the mirror), so a venue's balance follows the spread
+    # between them, not the sector. The group's direction follows the combined funding of its pairs.
+    direction_group: str = ""
+    group_side: int = 1
     enabled: bool = True
     group: str = ""  # label for reports and capital planning, e.g. rwa / io
     # Per-pair rotation overrides (None = use the strategy section). rotate: false = hold only.
@@ -342,6 +348,8 @@ def validate(cfg: Config) -> None:
             raise ConfigError(f"pair {p.name}: hedge_ratio must be positive")
         if p.hedge_notional_ratio is not None and p.hedge_notional_ratio <= 0:
             raise ConfigError(f"pair {p.name}: hedge_notional_ratio must be positive")
+        if p.direction_group and (p.direction != "auto" or p.group_side not in (1, -1)):
+            raise ConfigError(f"pair {p.name}: direction_group pairs need direction: auto and group_side 1 or -1")
         if p.maker.venue == p.hedge.venue and p.hedge_notional_ratio is None:
             raise ConfigError(f"pair {p.name}: two markets on one venue are different assets - set "
                               "hedge_notional_ratio (hedge $ per maker $)")

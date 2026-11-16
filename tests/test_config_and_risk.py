@@ -18,10 +18,10 @@ def write(tmp_path, text):
 
 def test_example_config_loads():
     cfg = load_config("config.example.yaml")
-    assert cfg.venues_needed() == ["hl:io"]
-    assert cfg.capital == {"hl:io": Dd(18000)}
-    assert {p.group for p in cfg.pairs} == {"us", "kr"}
-    assert cfg.execution.hedge_mode == "passive_first"
+    assert cfg.venues_needed() == ["hl:io", "hl:xyz"]
+    assert cfg.capital == {"hl:io": Dd(9000), "hl:xyz": Dd(9000)}
+    assert {p.group for p in cfg.pairs} == {"mem-us", "mem-kr"}
+    assert cfg.execution.hedge_mode == "taker"
 
 
 def test_unknown_keys_and_bad_values_are_rejected(tmp_path):
