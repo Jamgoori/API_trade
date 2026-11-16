@@ -27,6 +27,8 @@ from .venues.paper import PaperVenue
 
 log = logging.getLogger(__name__)
 
+DRAWDOWN_STOP_KEY = "__drawdown_stop__"
+
 HL_MODE_HELP = ("Hyperliquid account {address} is in '{mode}' mode. The bot needs Standard mode "
                 "(separate trade.xyz / Entropy balances): switch it in the Hyperliquid app or run "
                 "`hedgebot hl-mode --set-standard --i-understand-live`, then move USDC into the xyz and io dexes.")
@@ -75,6 +77,10 @@ class Engine:
         self.notifier = Notifier(secrets.telegram_token, secrets.telegram_chat, prefix=f"[hedgebot {cfg.mode}] ")
         self.halted = False
         self.halt_reason: str | None = None
+        # drawdown stop (risk.max_drawdown_pct): persisted, cleared only by `hedgebot resume`
+        self.drawdown_stopped = bool((self.journal.load_pair_state(DRAWDOWN_STOP_KEY) or {}).get("stopped"))
+        if self.drawdown_stopped:
+            self.halted, self.halt_reason = True, "drawdown"
         self._stop = False
         self._accounts: dict[str, AccountState] = {}
         self._account_ts: dict[str, float] = {}
@@ -189,6 +195,40 @@ class Engine:
         self.halted, self.halt_reason = False, None
         self.event("info", "resume", f"resumed ({why})", notify=True)
 
+    def drawdown_stop(self, detail: str) -> None:
+        """Close every pair and stay flat (persisted) until the user runs `hedgebot resume`."""
+        if self.drawdown_stopped:
+            return
+        self.drawdown_stopped = True
+        self.journal.save_pair_state(DRAWDOWN_STOP_KEY, {"stopped": True, "ts": time.time(), "detail": detail})
+        self.halted, self.halt_reason = True, "drawdown"
+        self.event("critical", "drawdown_stop", f"DRAWDOWN STOP: {detail}. Closing every pair; the bot stays flat "
+                   "until you run `hedgebot resume` and restart it.", notify=True)
+        self._close_everything()
+
+    def _close_everything(self) -> None:
+        for ex in self.executors:
+            try:
+                ex.shutdown()  # cancel the resting clip and hedge what it filled first
+            except Exception:
+                log.exception("%s: shutdown before flatten failed", ex.name)
+        try:
+            flatten_all(self)
+        except Exception as exc:
+            log.exception("flatten after drawdown stop failed")
+            self.event("critical", "flatten", f"closing after the drawdown stop failed: {exc!r} - close the "
+                       "positions by hand (hedgebot flatten)", notify=True)
+
+    def _open_legs(self) -> bool:
+        for ex in self.executors:
+            for leg in (ex.pair.maker, ex.pair.hedge):
+                try:
+                    if self.account(leg.venue, 0).position_size(leg.symbol) != 0:
+                        return True
+                except VenueError:
+                    return True
+        return False
+
     # ----------------------------------------------------------------- sizing
     def measure_scale(self) -> tuple[Decimal, Decimal, str] | None:
         """(total equity / total capital, lowest per-venue ratio, that venue); None when unmeasurable."""
@@ -284,6 +324,9 @@ class Engine:
                        f"{ {s: str(p.size) for s, p in acct.positions.items()} }")
         self.event("info", "start", f"started in {self.cfg.mode} mode with pairs "
                    f"{[e.name for e in self.executors]}", notify=True)
+        if self.drawdown_stopped:
+            self.event("critical", "drawdown_stop", "the drawdown stop is still active: the bot only keeps "
+                       "positions closed. Run `hedgebot resume` and restart to trade again.", notify=True)
 
     def _markets(self, venue: str) -> dict:
         v = self.venues[venue]
@@ -450,6 +493,8 @@ class Engine:
         if self.backstops:  # start-up canceled the old stops: put them back before anything else
             self._guarded("backstop", self.backstops.refresh)
             self._timers["backstop"] = time.time()
+        if self.drawdown_stopped and self._open_legs():  # a close that did not finish before a restart
+            self._close_everything()
         started = time.time()
         try:
             while not self._stop:
@@ -522,6 +567,8 @@ def flatten_all(engine: Engine, attempts: int = 3) -> list[str]:
 def _flatten_pair(engine: Engine, ex, attempts: int) -> list[str]:
     maker_sym, hedge_sym = ex.pair.maker.symbol, ex.pair.hedge.symbol
     try:
+        if ex.cross_asset and not ex.rt.ratio:  # state lost: read the ratio back from the legs
+            ex._set_ratio(ex._snapshot(0))
         for _ in range(attempts):
             m = engine.account(ex.maker.name, 0).position_size(maker_sym)
             if m != 0:

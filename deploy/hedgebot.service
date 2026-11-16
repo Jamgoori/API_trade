@@ -1,6 +1,6 @@
 # deploy/install.sh 가 @REPO@ / @USER@ 를 채워 /etc/systemd/system/hedgebot.service 로 설치합니다.
 [Unit]
-Description=hedgebot (Arcus <-> Hyperliquid hedge points bot)
+Description=hedgebot (Entropy hedged points bot)
 After=network-online.target
 Wants=network-online.target
 # 설정 오류처럼 계속 죽는 경우 10분에 5번까지만 재시작 (텔레그램으로 'stopped' 알림이 갑니다)

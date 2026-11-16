@@ -46,6 +46,7 @@ class PairData:
     hedge: Series
     maker_funding: list[tuple[int, float]]  # (ts_ms, hourly rate)
     hedge_funding: list[tuple[int, float]]
+    proxy_bars: tuple[int, int] = (0, 0)  # bars taken from a proxy venue (maker, hedge)
 
 
 def _cache_path(cache_dir: Path, kind: str, venue: str, symbol: str, interval: str, start_ms: int, end_ms: int) -> Path:
@@ -76,13 +77,59 @@ def _fetch_funding(venue: Venue, symbol: str, start_ms: int, end_ms: int, cache_
     return [(int(t), float(r)) for t, r in rows]
 
 
+def proxy_symbol(symbol: str, proxy_venue: str) -> str:
+    """io:SKHX -> xyz:SKHX for an hl:xyz proxy (HIP-3 symbols carry their dex prefix)."""
+    base = symbol.split(":", 1)[-1]
+    return f"{proxy_venue[3:]}:{base}" if proxy_venue.startswith("hl:") else base
+
+
+def splice_candles(main: list[Candle], proxy: list[Candle]) -> list[Candle]:
+    """Proxy bars before the first main bar, rescaled so the series joins without a jump."""
+    if not main or not proxy:
+        return main or proxy
+    first = main[0].t_ms
+    before = [c for c in proxy if c.t_ms < first]
+    if not before:
+        return main
+    join = next((c for c in proxy if c.t_ms >= first), before[-1])
+    if join.open <= 0:
+        return main
+    k = main[0].open / join.open
+    scaled = [Candle(c.t_ms, c.open * k, c.high * k, c.low * k, c.close * k, c.volume_usd) for c in before]
+    return scaled + main
+
+
+def _leg(venue: Venue, symbol: str, interval: str, start_ms: int, end_ms: int, cache: Path,
+         proxy: Venue | None) -> tuple[list[Candle], list[tuple[int, float]], int]:
+    candles = _fetch_candles(venue, symbol, interval, start_ms, end_ms, cache)
+    funding = _fetch_funding(venue, symbol, start_ms, end_ms, cache)
+    added = 0
+    if proxy is not None:
+        psym = proxy_symbol(symbol, proxy.name)
+        try:
+            pc = _fetch_candles(proxy, psym, interval, start_ms, end_ms, cache)
+            pf = _fetch_funding(proxy, psym, start_ms, end_ms, cache)
+        except Exception as exc:  # proxy market missing: keep the venue's own (shorter) history
+            log.warning("no proxy history for %s on %s: %s", psym, proxy.name, exc)
+            return candles, funding, 0
+        spliced = splice_candles(candles, pc)
+        added = len(spliced) - len(candles)
+        candles = spliced
+        first_f = funding[0][0] if funding else end_ms + 1
+        funding = [r for r in pf if r[0] < first_f] + funding
+    return candles, funding, added
+
+
 def load_pair_data(pair: PairConfig, venues: dict[str, Venue], interval: str, interval_ms: int, start_ms: int,
-                   end_ms: int, cache_dir: str | Path) -> PairData:
+                   end_ms: int, cache_dir: str | Path, proxies: dict[str, Venue] | None = None) -> PairData:
+    """Candles and funding of both legs. `proxies` maps a venue to another venue listing the same stocks
+    (e.g. hl:io -> hl:xyz): its bars fill the time before the venue listed the market."""
     cache = Path(cache_dir)
+    proxies = proxies or {}
     maker_v, hedge_v = venues[pair.maker.venue], venues[pair.hedge.venue]
     log.info("loading %s: %s %s / %s %s", pair.name, maker_v.name, pair.maker.symbol, hedge_v.name, pair.hedge.symbol)
-    maker = Series.from_candles(_fetch_candles(maker_v, pair.maker.symbol, interval, start_ms, end_ms, cache))
-    hedge = Series.from_candles(_fetch_candles(hedge_v, pair.hedge.symbol, interval, start_ms, end_ms, cache))
-    mf = _fetch_funding(maker_v, pair.maker.symbol, start_ms, end_ms, cache)
-    hf = _fetch_funding(hedge_v, pair.hedge.symbol, start_ms, end_ms, cache)
-    return PairData(pair, interval_ms, maker, hedge, mf, hf)
+    mc, mf, m_added = _leg(maker_v, pair.maker.symbol, interval, start_ms, end_ms, cache, proxies.get(pair.maker.venue))
+    hc, hf, h_added = _leg(hedge_v, pair.hedge.symbol, interval, start_ms, end_ms, cache, proxies.get(pair.hedge.venue))
+    data = PairData(pair, interval_ms, Series.from_candles(mc), Series.from_candles(hc), mf, hf)
+    data.proxy_bars = (m_added, h_added)
+    return data

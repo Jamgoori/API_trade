@@ -14,6 +14,7 @@ from __future__ import annotations
 import random
 from decimal import Decimal
 
+from .marketcal import is_us_regular_session
 from .models import Side
 from .util import HOURS_PER_YEAR, ZERO, D, bps, quantize_to_step
 
@@ -94,8 +95,19 @@ def rotation_fraction(fmin: Decimal, fmax: Decimal, rng: random.Random) -> Decim
     return D(round(rng.uniform(float(fmin), float(fmax)), 3))
 
 
-def rotation_window_open(rotate_when: str, maker_outside_rth: bool) -> bool:
-    return rotate_when == "any" or maker_outside_rth
+def rotation_window_open(rotate_when: str, maker_outside_rth: bool, ts_ms: int | None = None) -> bool:
+    if rotate_when == "any":
+        return True
+    if rotate_when == "us_session":
+        return ts_ms is not None and is_us_regular_session(ts_ms)
+    return maker_outside_rth
+
+
+def qty_ratio(notional_ratio: Decimal, maker_price: Decimal, hedge_price: Decimal) -> Decimal:
+    """Hedge quantity per unit of maker quantity that gives `notional_ratio` hedge $ per maker $."""
+    if hedge_price <= 0:
+        raise ValueError("hedge price must be positive")
+    return D(notional_ratio) * D(maker_price) / D(hedge_price)
 
 
 def at_target(position: Decimal, target: Decimal, tolerance: Decimal) -> bool:

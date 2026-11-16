@@ -129,6 +129,10 @@ class BacktestResult:
     rebalances: int = 0
     rebalance_usd: float = 0.0
     min_iso_distance_pct: dict[str, float] = field(default_factory=dict)
+    venue_volume: dict[str, float] = field(default_factory=dict)  # both legs, per venue
+    venue_oi_hours: dict[str, float] = field(default_factory=dict)  # notional x hours, both legs, per venue
+    max_drawdown_usd: float = 0.0  # total equity, peak to trough (bar closes)
+    max_drawdown_pct: float = 0.0
 
     @property
     def days(self) -> float:
@@ -170,6 +174,20 @@ class BacktestResult:
     @property
     def oi_hours(self) -> float:
         return sum(p.oi_hours for p in self.pairs.values())
+
+    def venue_volume_per_day(self, venue: str) -> float:
+        return self.venue_volume.get(venue, 0.0) / self.days
+
+    def venue_avg_oi(self, venue: str) -> float:
+        return self.venue_oi_hours.get(venue, 0.0) / (self.days * 24)
+
+    @property
+    def total_volume(self) -> float:
+        return sum(self.venue_volume.values())
+
+    @property
+    def total_avg_oi(self) -> float:
+        return sum(self.venue_oi_hours.values()) / (self.days * 24)
 
     @property
     def est_points(self) -> float:
@@ -215,6 +233,8 @@ class _Pair:
         self.ms = params.leg_specs[(self.mv, data.pair.maker.symbol)]
         self.hs = params.leg_specs[(self.hv, data.pair.hedge.symbol)]
         self.ratio = float(data.pair.hedge_ratio)
+        # two different assets: hedge $ per maker $, turned into a quantity ratio whenever the pair is flat
+        self.hnr = float(data.pair.hedge_notional_ratio) if data.pair.hedge_notional_ratio is not None else None
         self.notional = float(data.pair.notional_usd) * params.notional_scale
         self.leverage = params.leverage_override or float(data.pair.leverage)
         pc = data.pair
@@ -245,6 +265,10 @@ class _Pair:
         self.fptr_m = [0]
         self.fptr_h = [0]
         self.res = PairResult(self.name)
+
+    def reset_ratio(self, maker_px: float, hedge_px: float) -> None:
+        if self.hnr is not None and self.qty == 0 and hedge_px > 0:
+            self.ratio = self.hnr * maker_px / hedge_px
 
     def active(self, i: int) -> bool:
         return self.m_idx[i] >= 0 and self.h_idx[i] >= 0
@@ -307,6 +331,9 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
     daily: list[tuple[int, dict[str, float]]] = []
     day_cost: dict[int, float] = {}
     state = {"off": False}
+    venue_volume = {v: 0.0 for v in venues}
+    venue_oi_hours = {v: 0.0 for v in venues}
+    dd = {"peak": sum(equity.values()), "usd": 0.0, "pct": 0.0}
 
     def legs_on(venue: str):
         """(pair, signed size, spec, is_maker) for every open leg on a venue."""
@@ -443,6 +470,8 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
         book_cost(p, t, m_notional * m_fee_rate, h_notional * h_fee_rate,
                   abs(delta) * (m_px - mc) * side, abs(h_delta) * (h_px - hc) * h_side)
         p.res.maker_volume += m_notional
+        venue_volume[p.mv] += m_notional
+        venue_volume[p.hv] += h_notional
         if off_now:
             p.res.maker_volume_off_hours += m_notional
         p.res.hedge_volume += h_notional
@@ -530,6 +559,8 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
                 equity[p.mv] += p.qty * (mc - p.prev_m)
                 equity[p.hv] += h_size * (hc - p.prev_h)
                 p.res.oi_hours += abs(p.qty) * mc * (t - p.prev_t) / HOUR_MS
+                venue_oi_hours[p.mv] += abs(p.qty) * mc * (t - p.prev_t) / HOUR_MS
+                venue_oi_hours[p.hv] += abs(h_size) * hc * (t - p.prev_t) / HOUR_MS
                 for hour in range(p.prev_t // HOUR_MS + 1, t // HOUR_MS + 1):
                     ht = hour * HOUR_MS
                     pay_m = -p.qty * mc * _rate_at(p.data.maker_funding, ht, p.fptr_m)
@@ -627,6 +658,12 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
                     totals["transfers"] += 1
                     totals["transfer_usd"] += amount
 
+        total_eq = sum(equity.values())
+        dd["peak"] = max(dd["peak"], total_eq)
+        if dd["peak"] - total_eq > dd["usd"]:
+            dd["usd"] = dd["peak"] - total_eq
+            dd["pct"] = dd["usd"] / dd["peak"] * 100 if dd["peak"] > 0 else 0.0
+
         if next_rebalance is not None and t >= next_rebalance:
             rebalance(i)
             next_rebalance = t + int(params.rebalance_every_h * HOUR_MS)
@@ -647,6 +684,7 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
                 basis = None  # a stale close on one leg says nothing about the basis
 
             if p.direction == 0:
+                p.reset_ratio(mc, hc)
                 p.direction = strategy.choose_direction(
                     p.cfg.direction, _trailing_avg(p.data.maker_funding, t, fwin), _trailing_avg(p.data.hedge_funding, t, fwin),
                     params.min_carry_edge_apr, venue_bias.get(p.mv, 0.0))
@@ -655,7 +693,7 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
             venue_bias[p.mv] = venue_bias.get(p.mv, 0.0) + p.direction * p.notional
 
             def guard_ok(side: int) -> bool:
-                if not params.use_basis_guard:
+                if not params.use_basis_guard or p.hnr is not None:  # two assets: no basis to guard
                     return basis is not None
                 if basis is None or p.basis_ref is None:
                     return False
@@ -684,7 +722,7 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
                     p.phase = "build"
                     p.target = p.direction * p.notional / mc
                     continue
-                if not p.rotate or t < p.next_rot or not strategy.rotation_window_open(p.rotate_when, off):
+                if not p.rotate or t < p.next_rot or not strategy.rotation_window_open(p.rotate_when, off, t):
                     continue
                 if day_cost.get(day, 0.0) >= params.max_daily_cost_usd:
                     p.next_rot = t + HOUR_MS // 2
@@ -697,6 +735,7 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
                     p.next_rot = t + HOUR_MS // 4
                     continue
                 trade(p, -p.qty * frac, i, t)
+                p.reset_ratio(mc, hc)
                 if flip:
                     p.direction = -p.direction
                     p.res.flips += 1
@@ -724,4 +763,8 @@ def run_backtest(datas: list[PairData], params: BacktestParams, start_ms: int, e
         transfer_usd=totals["transfer_usd"],
         daily_equity=daily,
         groups={p.name: p.cfg.group for p in pairs},
+        venue_volume=venue_volume,
+        venue_oi_hours=venue_oi_hours,
+        max_drawdown_usd=dd["usd"],
+        max_drawdown_pct=dd["pct"],
     )

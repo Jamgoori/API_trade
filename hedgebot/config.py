@@ -14,6 +14,9 @@ from .util import D
 
 MODES = ("paper", "testnet", "live")
 DIRECTIONS = ("auto", "long_maker", "short_maker")
+# off_hours: Arcus off-hours only (HL markets never report off-hours, so HL-maker pairs need another window)
+# us_session: 09:30-16:00 ET on US trading days (stock oracles live, books tightest)
+ROTATION_WINDOWS = ("off_hours", "any", "us_session")
 
 
 @dataclass
@@ -31,6 +34,10 @@ class PairConfig:
     leverage: int = 5
     direction: str = "auto"
     hedge_ratio: Decimal = Decimal(1)  # hedge qty per 1 unit of maker qty (1 for the same ticker)
+    # Two different assets (e.g. io:DRAM vs io:SNDK on one venue): hedge notional per $1 of maker notional,
+    # usually the volatility ratio. The quantity ratio is fixed from prices whenever the pair builds from flat
+    # and replaces hedge_ratio. The cross-venue basis guard does not apply to such pairs.
+    hedge_notional_ratio: Decimal | None = None
     enabled: bool = True
     group: str = ""  # label for reports and capital planning, e.g. rwa / io
     # Per-pair rotation overrides (None = use the strategy section). rotate: false = hold only.
@@ -92,7 +99,7 @@ class StrategyConfig:
     max_hold_h: float = 8
     rotation_fraction_min: Decimal = Decimal("0.3")
     rotation_fraction_max: Decimal = Decimal("0.7")
-    rotate_when: str = "off_hours"  # off_hours | any
+    rotate_when: str = "off_hours"  # off_hours | any | us_session
     max_daily_cost_usd: Decimal = Decimal(20)
     basis_guard_bps: Decimal = Decimal(8)
     max_maker_spread_bps: Decimal = Decimal(25)
@@ -145,6 +152,11 @@ class RiskConfig:
     isolated_topup_target_pct: Decimal = Decimal(15)
     max_account_leverage: Decimal = Decimal(5)
     max_daily_loss_pct: Decimal = Decimal(2)
+    # Total equity this far below its high-water mark (deposits / withdrawals / transfers excluded):
+    # warn at drawdown_warn_pct; at max_drawdown_pct close every pair and stay flat until `hedgebot resume`.
+    # 0 = off. Meant for books whose legs are different assets (their spread can trend for weeks).
+    drawdown_warn_pct: Decimal = Decimal(0)
+    max_drawdown_pct: Decimal = Decimal(0)
     stale_data_s: float = 20
     max_consecutive_errors: int = 5
 
@@ -328,6 +340,11 @@ def validate(cfg: Config) -> None:
             raise ConfigError(f"pair {p.name}: notional_usd and leverage must be positive")
         if p.hedge_ratio <= 0:
             raise ConfigError(f"pair {p.name}: hedge_ratio must be positive")
+        if p.hedge_notional_ratio is not None and p.hedge_notional_ratio <= 0:
+            raise ConfigError(f"pair {p.name}: hedge_notional_ratio must be positive")
+        if p.maker.venue == p.hedge.venue and p.hedge_notional_ratio is None:
+            raise ConfigError(f"pair {p.name}: two markets on one venue are different assets - set "
+                              "hedge_notional_ratio (hedge $ per maker $)")
         for leg in (p.maker, p.hedge):
             if leg.venue != "arcus" and not leg.venue.startswith("hl:"):
                 raise ConfigError(f"pair {p.name}: unknown venue {leg.venue} (use arcus, hl:xyz, hl:io)")
@@ -338,8 +355,8 @@ def validate(cfg: Config) -> None:
             raise ConfigError(f"pair {p.name}: need 0 < min_hold_h <= max_hold_h")
         if not (0 < rot.fraction_min <= rot.fraction_max <= 1):
             raise ConfigError(f"pair {p.name}: rotation fractions must satisfy 0 < min <= max <= 1")
-        if rot.window not in ("off_hours", "any"):
-            raise ConfigError(f"pair {p.name}: rotate_when must be off_hours or any")
+        if rot.window not in ROTATION_WINDOWS:
+            raise ConfigError(f"pair {p.name}: rotate_when must be one of {ROTATION_WINDOWS}")
     s = cfg.strategy
     if not (0 < s.clip_usd_min <= s.clip_usd_max):
         raise ConfigError("strategy: need 0 < clip_usd_min <= clip_usd_max")
@@ -347,8 +364,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError("strategy: need 0 < min_hold_h <= max_hold_h")
     if not (0 < s.rotation_fraction_min <= s.rotation_fraction_max <= 1):
         raise ConfigError("strategy: rotation fractions must satisfy 0 < min <= max <= 1")
-    if s.rotate_when not in ("off_hours", "any"):
-        raise ConfigError("strategy.rotate_when must be off_hours or any")
+    if s.rotate_when not in ROTATION_WINDOWS:
+        raise ConfigError(f"strategy.rotate_when must be one of {ROTATION_WINDOWS}")
     if s.maker_price not in ("join", "improve"):
         raise ConfigError("strategy.maker_price must be join or improve")
     if cfg.paper.maker_fill not in ("through", "touch"):
@@ -360,6 +377,10 @@ def validate(cfg: Config) -> None:
         raise ConfigError("risk: need 1 < backstop_margin_ratio < margin_ratio_critical")
     if r.isolated_topup_target_pct <= r.isolated_liq_buffer_warn_pct:
         raise ConfigError("risk: isolated_topup_target_pct must be above isolated_liq_buffer_warn_pct")
+    if r.drawdown_warn_pct < 0 or r.max_drawdown_pct < 0 or r.max_drawdown_pct >= 100:
+        raise ConfigError("risk: drawdown_warn_pct / max_drawdown_pct must be 0 (off) or a percentage below 100")
+    if r.max_drawdown_pct > 0 and r.drawdown_warn_pct >= r.max_drawdown_pct:
+        raise ConfigError("risk: drawdown_warn_pct must be below max_drawdown_pct")
     if not (0 < r.backstop_isolated_buffer_pct < r.isolated_liq_buffer_critical_pct):
         raise ConfigError("risk: need 0 < backstop_isolated_buffer_pct < isolated_liq_buffer_critical_pct")
     if not cfg.execution.hedge_slippage_bps:

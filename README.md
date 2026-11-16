@@ -1,152 +1,166 @@
-# hedgebot: Arcus ↔ Hyperliquid HIP-3 헤지 포인트 봇
+# hedgebot: Entropy 전용 헤지 포인트 봇
 
-Arcus(Robinhood Chain)와 Hyperliquid HIP-3 거래소(trade.xyz = `hl:xyz`, Entropy = `hl:io`)에
-**같은 종목을 같은 수량, 반대 방향**으로 잡아서 가격 위험 없이 **Entropy 포지션·거래량(주력, 자산 75%)**과
-Arcus 포인트(자산 25%)를 쌓는 봇입니다.
+Hyperliquid의 HIP-3 거래소 **Entropy(`hl:io`) 한 곳에서만** 거래합니다. 서로 강하게 같이 움직이는 메모리 종목끼리
+한쪽은 롱, 다른 쪽은 숏으로 잡아서 시장 방향 위험을 줄인 채 **Entropy 포지션(OI)과 거래량**을 쌓습니다.
+Arcus·trade.xyz는 쓰지 않습니다. 돈은 Entropy 계정 하나에만 두면 되고 거래소 간 이체가 없습니다.
 
 ```
-RWA 작업  Arcus NVDA·TSLA  메이커(수수료 0%)  ──체결──▶  trade.xyz  반대 방향 헤지
-io 작업   Arcus SNDK·DRAM·NBIS 메이커          ──체결──▶  Entropy    반대 방향 헤지 (주력)
-          헤지: 메이커로 먼저 걸고, 20초 경과 또는 3bp 불리하면 테이커
+MEM-US   DRAM(메모리 바스켓)  ⇄  SNDK(샌디스크)     교차증거금   DRAM $12,000 : SNDK $9,600
+MEM-KR   SKHX(SK하이닉스)     ⇄  EWY(한국 ETF)      격리 전용    SKHX $5,600  : EWY $8,960
+         ────────────────────────────────────────────────────────────────
+         Entropy OI 약 $36k (잔고 $18k의 2배) · 3일마다 한 번 전부 닫고 다시 쌓음
 ```
 
-> 투자 조언이 아닙니다. 포인트 배분은 각 거래소 재량이고, 아래 수치는 모두 과거 데이터와 가정에 기반한 추정입니다.
+> 투자 조언이 아닙니다. 서로 다른 종목으로 헤지하므로 **가격 위험이 0이 아닙니다**(2장). Entropy 포인트 제도는
+> 아직 공식 발표가 없고, 아래 수치는 모두 과거 데이터와 가정에 기반한 추정입니다.
 
 ---
 
-## 1. 구조
+## 1. 전략
 
-자산을 두 작업으로 나눕니다(총 $18k 예시: Arcus $8k / Entropy $8k / trade.xyz $2k, `config.example.yaml`).
+### 왜 이 종목들인가
 
-| 작업 | 비중 | 구성 | 목적 |
-|---|---|---|---|
-| **RWA 작업** | 약 22% ($4k) | Arcus NVDA $3k·TSLA $2k ↔ **trade.xyz** 헤지 (Arcus 약 $2k + xyz $2k) | Arcus 포인트(거래량), 6~12시간마다 30~70% 회전 |
-| **io 작업 (주력)** | 약 78% ($14k) | Entropy SNDK $16.8k·DRAM $5.1k·NBIS $5.1k (5배, 목표 $27k) ↔ **Arcus** 헤지 (Entropy $8k + Arcus 약 $6k) | Entropy OI 최대, 24~48시간마다 30~60% 회전. **3일마다 리밸런싱 전제** |
+Entropy에서 거래되는 종목 중 같은 종목이 두 번 상장된 것은 없습니다. 그래서 같은 거래소 안에서 헤지하려면
+**같이 움직이는 다른 종목**을 써야 합니다. 120일 실데이터로 모든 조합을 비교했고, 메모리 반도체 묶음이 압도적이었습니다.
 
-- Arcus와 Entropy에 함께 있는 종목은 SNDK·DRAM·NBIS뿐입니다(ANTH·OAI 같은 프리 IPO는 Arcus에 없음).
-- 헤지된 페어는 양쪽 거래량이 같습니다. 그래서 Arcus를 메이커(수수료 0%)로 두고 Entropy를 헤지 쪽으로 둬도
-  Entropy 거래량은 똑같이 쌓이고, 비용은 이 배치가 가장 쌉니다.
-- 회전 주기·비율은 페어별로 바꿀 수 있고, `rotate: false`면 회전 없이 보유만 합니다.
+| 조합 | 일간 수익률 상관 | 헤지한 뒤 연 변동성 (총 명목가 $1당) |
+|---|---|---|
+| **DRAM ⇄ SNDK** | 0.91~0.96 | 17~19% |
+| **SKHX ⇄ EWY** | 0.93~0.96 | 12~13% |
+| 두 페어를 합치면 | | **약 10%** (서로 다르게 흔들려서 상쇄) |
+| ANTH ⇄ OAI (프리 IPO) | 0.5 | 25% (OAI 호가도 얇음) |
+| NVDA ⇄ AAPL, NBIS ⇄ 기타 | 0.4~0.75 | 30~40% |
 
-| 항목 | 구현과 이유 |
+- 두 페어 모두 "단일 종목 ⇄ 바스켓"(SNDK ⇄ 메모리 바스켓, SK하이닉스 ⇄ 한국 ETF) 구조라 방향을 어느 쪽으로 잡아도 헤지 효과가 같습니다.
+  그래서 방향은 **펀딩을 받는 쪽**으로 자유롭게 정합니다.
+- **변동성 비율로 금액을 맞춥니다**(`hedge_notional_ratio`). SNDK가 DRAM보다 1.25배 크게 움직이므로 SNDK는 DRAM의 0.8배 금액,
+  SKHX가 EWY보다 1.6배 크게 움직이므로 EWY는 SKHX의 1.6배 금액입니다. 금액을 1:1로 맞추면 변동성이 약 30% 커집니다.
+- 메이커(호가에 걸어서 체결)는 스프레드가 넓은 쪽(DRAM, SKHX), 헤지는 호가가 두꺼운 쪽(SNDK, EWY)에 둡니다.
+- Entropy 수수료는 growth mode로 메이커 0.3bp·테이커 0.9bp라 비용은 거의 스프레드입니다.
+
+### 3일 주기
+
+```
+쌓기(1~2시간) → 보유 66~78시간 → 미국 정규장(09:30~16:00 ET)에 100% 닫기 → 바로 다시 쌓기 → …
+```
+
+- 보유하는 동안은 거래하지 않습니다. 실제 회전 간격은 정규장 시간을 기다리느라 평균 약 3.7일입니다.
+- 전부 닫았다 다시 쌓는 이유: ① 거래량이 생기고 ② 헤지 비율을 그날 가격으로 다시 맞추고 ③ 격리증거금이 초기화되고
+  ④ 7일 평균 펀딩을 받는 방향으로 다시 정합니다(같은 비용으로 방향 전환까지).
+- 정규장에만 회전하는 이유: 주식 오라클이 살아 있고 호가가 가장 촘촘한 시간입니다.
+
+### 포인트
+
+Entropy는 아직 포인트 계산식을 공개하지 않았습니다(2026년 10월 기준 리더보드 "Coming Soon", 백엔드에 `pointsMultiplier`
+값만 보임). 그래서 어느 쪽으로 계산하든 쌓이게 했습니다:
+**OI**(시간의 약 97% 동안 보유), **거래량**(3일마다 전체 명목가의 2배), **4개 종목**에 걸친 거래 이력.
+
+---
+
+## 2. 위험 (꼭 읽어 주세요)
+
+예전 구조(Arcus ⇄ Entropy, 같은 종목)는 가격 위험이 거의 없었습니다. **지금 구조는 두 종목의 차이만큼 손익이 흔들립니다.**
+SNDK가 메모리 바스켓보다 더 오르거나, SK하이닉스가 한국 ETF와 다르게 움직이면 그만큼 벌거나 잃습니다.
+장기 기대값은 0 근처(+ 펀딩 − 비용)지만 중간에 흔들리는 폭은 작지 않습니다.
+
+기본 크기(잔고의 2배)에서 112일 백테스트 기준:
+
+- 하루 평균 ±$260 (잔고의 1.4%), 가장 나빴던 날 **-$1,018**
+- 최고점 대비 최대 **-$2,900~3,800** (잔고의 15~19%)
+- 실적 발표(SanDisk, SK하이닉스, 마이크론)나 한국·미국 장 시간 차이로 한쪽만 크게 움직일 때가 가장 위험합니다.
+
+보호 장치(위에서부터 먼저 작동):
+
+| 장치 | 내용 |
 |---|---|
-| 증거금 | Arcus·trade.xyz는 **교차증거금**(계정 전체가 받쳐 줘서 청산까지 여유가 큼). Entropy는 격리 전용 |
-| Entropy 레버리지 | **5배**(청산까지 약 17%). 청산가 8% 이내로 오면 **Entropy 계정의 여유 잔고로 격리증거금을 자동 보충**, 3일마다 Arcus 이익을 Entropy로 옮김 |
-| 방향 | **펀딩비 7일 평균**으로 결정. 차이가 작으면 같은 거래소 안에서 롱·숏이 상쇄되게 배치 |
-| 헤지 체결 | 반대쪽에 **메이커로 먼저 걸고, 20초 경과 또는 3bp 불리 시 테이커**. `hedge_mode: taker`면 즉시 테이커 |
-| 회전 시간대 | Arcus 장외시간(포인트 부스트 시간대)에만 |
+| 페어 구성 | 상관 0.9 이상 종목끼리, 변동성 비율로 금액 맞춤, 두 페어로 분산 |
+| 교차증거금 (MEM-US) | 한쪽 손실을 다른 쪽 이익이 바로 받쳐 줌. 두 종목 차이가 50% 넘게 벌어져야 청산 수준 |
+| 격리 다리 (SKHX, EWY) 3배 | 한 다리가 약 30% 불리하게 움직여야 청산. **청산가 8% 이내면 계정 여유 잔고로 자동 보충**(15%까지) |
+| 거래소 손절 | 봇이 꺼져 있어도 작동. 격리 다리는 청산가 2% 앞, 교차 계정은 증거금 비율 1.25. 한 다리가 닫히면 봇이 반대쪽도 정리 |
+| 일일 손실 3% | 그날 신규 진입·회전 중단 (포지션은 유지) |
+| **손실 한도** | 자산이 최고점 대비 **12% 빠지면 텔레그램 알림, 25% 빠지면 모든 페어를 닫고 멈춤**. `hedgebot resume`으로만 다시 시작. 입금·출금은 손익으로 안 셈 |
+| 불균형 수리·헤지 실패 처리 | 두 다리 차이가 $40 넘으면 큰 쪽을 줄임. 헤지가 안 되면 메이커 쪽을 즉시 되돌림 (한쪽만 들고 있지 않음) |
 
-안전장치:
-
-- **불균형 자동 수리**: 두 다리 수량 차이가 $40 이상이면 8초 확인 후 큰 쪽을 줄여서 맞춤(reduce-only)
-- **헤지 실패 시**: IOC를 5/15/40bp로 넓혀도 안 되면 Arcus 쪽을 즉시 되돌림. 한쪽만 들고 있지 않음
-- **거래소 손절(봇이 꺼져 있어도 작동)**: 각 다리에 reduce-only 손절 주문을 거래소에 걸어 둠.
-  순서는 `봇 축소(증거금 비율 1.7) → 거래소 손절(1.25 / 격리는 청산가 2% 앞) → 청산`.
-  Arcus는 포지션 전체 손절(positionTpsl), Hyperliquid는 트리거 주문이며 포지션이 바뀌면 봇이 다시 겁니다.
-  잔고가 충분해서 청산이 불가능한 다리(예: 100% 넘게 빠져야 청산)에는 걸지 않습니다.
-- **한쪽이 닫힌 뒤**: 손절·청산으로 한쪽 다리가 사라지면 봇이 반대쪽도 바로 정리해서 맨 포지션을 남기지 않고,
-  6시간(`stop_cooldown_h`) 쉰 뒤 방향을 새로 정해 증거금이 허락하는 만큼만 다시 쌓습니다. 봇이 꺼져 있던 동안
-  손절이 났다면 다시 켜는 즉시 같은 처리를 합니다.
-- **봇이 멈추거나 오류가 날 때**: 메이커 주문을 취소하고 이미 체결된 만큼은 헤지한 뒤 종료합니다. 포지션과 거래소 손절은 그대로 둡니다.
-  한 페어에서 예상 못 한 오류가 반복되면 그 페어만 주문을 거두고 멈추며, 나머지·리스크 관리·손절은 계속 돕니다.
-  시작할 때 거래소가 안 되면 기다렸다 다시 시도하고, 시작 자체가 불가능하면(키·모드 문제) 텔레그램으로 알립니다.
-- **응답이 끊긴 주문**: Hyperliquid는 주문 ID(cloid)로, Arcus는 clientId 취소로, 헤지는 포지션 대조로 다시 맞춰서 같은 헤지를 두 번 내지 않습니다.
-- **헤지 거래소 장애**: Hyperliquid가 20초 넘게 오류를 내면 체결된 Arcus 쪽을 되돌려 한쪽만 남기지 않습니다.
-- **Arcus 데드맨 스위치는 기본으로 끔**: Arcus는 스위치가 발동하면 서브계정의 "모든" 주문을 지우는데, 여기에 Arcus 손절도 포함됩니다
-  (테스트넷에서 확인). 그래서 손절을 지키는 쪽을 택했습니다. 대신 VPS가 통째로 죽으면 걸려 있던 메이커 주문 하나(최대 $2,000×배수)가 남을 수 있고,
-  다시 켜면 봇이 그 체결분을 맞춥니다. `arcus.dead_mans_switch_s`로 켤 수 있습니다.
-- **장외시간 규칙 반영**: Arcus 장외 초기증거금 상향(신규 진입 레버리지 한도), 가격 밴드, 04:00·20:00 ET 경계 전후 3분 진입 금지
-- **일일 비용 예산**($20×배수) 초과 시 회전 중단, **일일 손실 2%** 초과 시 신규 진입 중단(헤지 포지션은 유지).
-  입금·출금·거래소 간 이체는 손익으로 치지 않습니다.
-- 재시작해도 상태 유지(SQLite 저널 + 실제 포지션으로 복구)
+흔들림을 줄이고 싶으면 크기를 줄이세요(아래 표의 1.5배: `notional_usd`를 12000→9000, 5600→4200).
 
 ---
 
-## 2. 백테스트 결과 (실데이터, 기본 설정 $18k)
+## 3. 백테스트 (실데이터 112일, 잔고 $18k)
 
-`hedgebot backtest`로 Arcus/Hyperliquid 실제 캔들과 펀딩비 이력을 그대로 재생한 결과입니다(2026-10-25 기준).
+`hedgebot backtest --days 112 --interval 1h --price-proxy hl:io=hl:xyz` (2026-07-27 ~ 11-16).
+Entropy에 상장되기 전 기간(SKHX·EWY·DRAM은 최근 상장)은 **trade.xyz의 같은 종목 가격**으로 채웠습니다.
+무작위 요소(보유 시간 등)를 바꿔 5번 돌린 범위입니다.
 
-| 기간 | 순손익 | 펀딩 | 수수료+스프레드 | Arcus 거래량/일 (RWA / io) | Entropy 거래량/일 | 포인트/주* | 청산·손절 |
-|---|---|---|---|---|---|---|---|
-| 45일, 15분봉 | **+$104** | +$295 | -$213 | $23.7k ($8.2k / $15.5k) | **$15.5k** | 5.5 | 0 |
-
-Entropy 평균 OI **$25.7k**, 자동 보충 5회($3.0k), 3일 리밸런싱 10회(평균 $1.55k), 청산가에 가장 가까웠던 거리 6.9%,
-Arcus 최저 증거금 비율 2.76. 경고선 3.0 밑으로 내려가면 봇이 추가 이체 금액을 알려 주는데, 45일간 5번 있었습니다.
-그 경고를 무시하고 3일 리밸런싱만 해도 Arcus 최저 2.33으로 자동 축소선(1.7) 위였고, 축소·손절·청산은 0회였습니다(`--no-transfers`).
-Entropy $8k 중 $5.4k(= $27k ÷ 5배)가 포지션 증거금이고, 나머지는 청산가에 가까워질 때 자동으로 넣는 보충분입니다.
-
-Entropy 목표 크기 비교 (Arcus $8k / Entropy $8k / xyz $2k, Entropy 5배, 24~48시간 회전, 3일 리밸런싱, 45일):
-
-| Entropy 목표 | 순손익 | Entropy OI 평균 | Entropy 거래량/일 | 청산가 최근접 | Arcus 최저 증거금 비율 | 경고 시 추가 이체 | 3일 리밸런싱 이동액 |
-|---|---|---|---|---|---|---|---|
-| $22.5k | +$90 | $21.6k | $12.7k | 6.5% | 2.86 | 1회 | $5.5k |
-| **$27k (기본)** | **+$104** | **$25.7k** | **$15.5k** | 6.9% | 2.76 | 5회 | $15.5k |
-| $32k | +$128 | $26.8k | $11.5k | 6.0% | 2.36 | 14회 | $39k |
-| $36k | +$188 | $28.4k | $8.8k | 6.4% | 2.33 | 14회 | $42k |
-
-- 포지션 크기의 한계는 **Arcus 증거금**입니다. Arcus가 RWA와 Entropy 헤지를 같이 떠안아서, Entropy를 키울수록 Arcus 증거금 비율이 내려갑니다.
-- $27k를 넘기면 OI는 거의 늘지 않습니다($27k → $36k에 OI +10%). 증거금이 꽉 차서 가격이 움직이면 다시 채우지 못하고,
-  회전도 줄어서 거래량은 오히려 떨어집니다. 대신 옮겨야 하는 금액이 3배 가까이 늘어납니다.
-- 손익이 $36k에서 높은 건 SNDK 펀딩 수입이 커서이고, 펀딩 방향이 바뀌면 그대로 손실 쪽으로 커집니다.
-- Entropy 거래량은 싸게 만들어집니다(Arcus 메이커 0% + Entropy 헤지 약 1bp). 회전을 짧게(예: 8~16시간) 하면 거래량이 늘고 하루 비용이 몇 달러 늘어납니다.
-
-\* Arcus 포인트는 **가정치**입니다: 커뮤니티 공개 기록 기준 RWA 거래량 $100만당 약 33포인트.
-
-- **펀딩비 수입이 비용을 메웁니다.** 지난 45일간 Arcus 롱은 연 10~16%, HL 롱은 연 4~13%를 냈고, 봇은 받는 쪽으로 방향을 잡았습니다.
-- **회전을 줄이면 거래량·포인트는 줄고 수익은 늘어납니다.** 회전 없이 보유만 하면 45일 +$49, 1.5~4시간 회전이면 -$67에 포인트 2배입니다(`--sweep`).
-- **거래소 간 잔고가 벌어집니다.** 헤지라 합계는 같아도 한쪽이 벌면 다른 쪽이 잃습니다. Entropy 5배는 이 차이에 민감해서
-  **3일마다 봇이 알려 주는 금액만큼 Arcus → Entropy(또는 반대)로 옮기는 것을 전제**로 크기를 잡았습니다.
-
-### 3일마다 리밸런싱하면? (io 작업만, 45일 실데이터)
-
-Arcus ↔ Entropy 잔고를 3일마다 계획 비율로 되돌리는 경우를 Entropy 레버리지별로 비교했습니다(`--rebalance-every-h 72`,
-이 표는 Entropy $5,250 / Arcus $5,250 배분 기준).
-
-| Entropy 레버리지 (명목가) | 리밸런싱 | Entropy OI 평균 | Entropy 거래량/일 | 청산가에 가장 가까웠던 거리 | 자동 보충 | 이체 횟수 (평균 금액) |
+| 크기 (명목가/잔고) | Entropy OI 평균 | 거래량/일 (양쪽 다리) | 112일 비용* | 최고점 대비 최대 손실 | 하루 변동 (1σ) | 순손익 범위 |
 |---|---|---|---|---|---|---|
-| 2배 ($8k) | 없음 | $7.5k | $2.8k | 30.9% | 0 | 0 |
-| 2배 | 3일마다 | $7.7k | $3.1k | 30.9% | 0 | 8회 ($390) |
-| 4배 ($16k) | 없음 | $13.8k | $4.5k | 4.8% | 4 | 0 |
-| **4배** | **3일마다** | **$15.4k** | **$6.3k** | **7.8%** | 0 | 10회 ($580) |
-| 5배 ($20k) | 없음 | $16.3k | $5.7k | 0.6% (손절 1회) | 9 | 0 |
-| 5배 | 3일마다 | $18.9k | $7.2k | 5.5% | 7 | 9회 ($620) |
+| 1.5배 | $26.6k | $14.6k | $46 | -$2.1k~2.8k (11~14%) | $196 | +$45 ~ +$1,357 |
+| **2배 (기본)** | **$35.6k** | **$19.5k** | **$58** | **-$2.9k~3.8k (15~19%)** | **$262** | **+$20 ~ +$1,800** |
+| 2.5배 | $44.3k | $24.2k | $89 | -$3.6k~4.8k (18~23%) | $333 | -$26 ~ +$1,371 |
+| 3배 | $52.9k | $29.0k | $87 | -$4.3k~5.9k (21~27%) | $395 | +$131 ~ +$1,805 |
 
-- **2배에서는 리밸런싱이 필요 없습니다.** 청산까지 30% 넘게 여유가 남습니다.
-- 리밸런싱의 가치는 **같은 돈으로 Entropy 레버리지를 4배로 올릴 수 있게 해 주는 것**입니다. OI·거래량이 약 2배가 됩니다.
-- 3일 안에 오는 급변(SNDK 하루 ±13%)은 리밸런싱으로 못 막습니다. 그건 자동 보충과 거래소 손절이 맡습니다.
-- 4배면 Arcus 계정 증거금 비율이 3.4까지 내려갑니다(경고 3.0). 그래서 Arcus 쪽 여유도 함께 봐야 합니다.
+\* 수수료 + 스프레드 − 펀딩 수입. 모든 크기·모든 실행에서 청산·거래소 손절 0회 (2배 기준 5번 실행 중 격리 자동 보충 총 2회).
 
-봇은 `rebalance` 설정에 따라 72시간마다 "Arcus → Entropy $X"처럼 금액을 알려 주고, `hedgebot rebalance`로 언제든 확인할 수 있습니다.
-RWA 쪽(trade.xyz)은 리밸런싱 대상에서 뺐습니다.
+- **순손익이 플러스인 건 이 기간 운이 좋았던 것**입니다(대부분 두 종목 차이에서 나옴). 기대값으로 보지 마세요. 비용 자체는 하루 $0.5~1 수준입니다.
+- 예전 구조(Arcus $8k + Entropy $8k + trade.xyz $2k)는 Entropy OI $25.7k·거래량 $15.5k/일에 3일마다 거래소 간 이체가 필요했습니다.
+  지금은 같은 $18k로 **Entropy OI $35.6k·거래량 $19.5k/일**, 이체 없음. 대신 2장의 가격 위험이 생깁니다.
 
-백테스트가 알 수 없는 것: 메이커 주문이 실제로 체결됐을지(과거 호가창 없음), 실제 스프레드(실측 기반 가정값 사용), 실제 포인트 공식.
-그래서 실전 처음 며칠은 `hedgebot report --hours 24`로 실제 체결률·비용·헤지 지연을 확인하세요.
+회전 주기 비교 (2배, 같은 기간):
+
+| 회전 | 거래량/일 | OI 평균 | 112일 비용* |
+|---|---|---|---|
+| 보유만 (회전 없음) | $0.3k | $38.5k | $180 (펀딩 방향을 못 바꿔서 오히려 비쌈) |
+| 8~16시간마다 | $50.4k | $34.7k | $471 |
+| 24~48시간마다 | $29.9k | $35.3k | $141 |
+| **3일마다 (기본)** | **$19.7k** | **$35.7k** | **$98** |
+| 5~7일마다 | $10.0k | $35.7k | -$70 (펀딩 수입이 더 큼) |
+| 3일마다, 50%만 | $11.7k | $35.7k | -$20 |
+
+- 포인트가 거래량 위주라면 회전을 늘리고(24~48시간), OI 위주라면 5~7일로 늘리면 됩니다. 3일은 그 중간입니다.
+- 헤지를 바로 테이커로 하면(`hedge_mode: taker`) 비용이 약 3배가 됩니다. 기본은 메이커로 먼저 걸고 20초 뒤 테이커입니다.
+
+백테스트가 알 수 없는 것: 메이커 주문이 실제로 체결됐을지(과거 호가창 없음, 헤지의 50%가 메이커로 잡힌다고 가정),
+실제 스프레드(Entropy 반 스프레드 2~3.5bp 가정), 실제 포인트 공식. 실전 처음 며칠은 `hedgebot report --hours 24`로 확인하세요.
 
 ---
 
-## 3. 실전 시작 (VPS에서 24시간)
+## 4. 실전 시작 (VPS에서 24시간)
 
 봇은 계속 켜져 있어야 하므로 VPS(Ubuntu 22.04/24.04, 1 vCPU·1GB RAM이면 충분)에서 돌립니다.
-이 클라우드 세션은 계속 켜져 있지 않습니다.
+
+### 예전 구조(Arcus)를 돌리고 있었다면 먼저 정리
+
+```bash
+cd API_trade
+sudo systemctl stop hedgebot
+.venv/bin/hedgebot flatten --mode live --confirm --i-understand-live    # 예전 config.yaml 로 모든 포지션 정리
+git fetch origin claude/trusting-brown-gaokjv && git checkout claude/trusting-brown-gaokjv && git pull
+.venv/bin/pip install -e .
+mv config.yaml config-arcus-old.yaml
+mv data/journal.sqlite data/journal-arcus-old.sqlite                    # 새 전략은 새 기록으로 시작
+cp config.example.yaml config.yaml && sed -i 's/^mode: paper /mode: live  /' config.yaml
+```
+
+그다음 Arcus·trade.xyz에 남은 돈을 Hyperliquid의 **Entropy(io) 거래소**로 옮기고 아래 3)부터 진행하세요.
+
+### 새로 설치
 
 ```bash
 # 1) 설치: 가상환경 + config.yaml/.env 생성 + systemd 서비스 등록
-git clone -b claude/kind-knuth-nt3une https://github.com/Jamgoori/API_trade && cd API_trade
+git clone -b claude/trusting-brown-gaokjv https://github.com/Jamgoori/API_trade && cd API_trade
 bash deploy/install.sh
 
-# 2) 키 입력 (아래 5장). 채팅이나 다른 곳에 붙여넣지 마세요
+# 2) 키 입력 (5장). 채팅이나 다른 곳에 붙여넣지 마세요
 nano .env
 
-# 3) 키·종목·잔고 확인
+# 3) Hyperliquid 계정이 Standard 모드인지 확인 (통합 계정이면 봇이 시작을 거부)
+.venv/bin/hedgebot hl-mode
+#    아니면: .venv/bin/hedgebot hl-mode --set-standard --i-understand-live
+#    그리고 Hyperliquid 웹에서 USDC 를 Entropy(io) 거래소로 옮기세요 (봇 키는 이체 권한이 없습니다)
+
+# 4) 키·종목·잔고 확인
 .venv/bin/hedgebot check --mode live
 
-# 4) Hyperliquid 계정이 Standard 모드인지 확인 (통합 계정이면 봇이 시작을 거부합니다)
-.venv/bin/hedgebot hl-mode
-#    "unifiedAccount" 등이면: 웹에서 바꾸거나 아래 명령 후, trade.xyz·Entropy 잔고를 각각 옮기세요
-#    .venv/bin/hedgebot hl-mode --set-standard --i-understand-live
-
-# 5) 주문 기능 점검: 거래소마다 최소 금액(약 $12)으로 실제 주문 걸기 → 거래소 기록과 대조 → 취소,
-#    --fill 이면 최소 수량 진입 → 거래소 손절 걸기/취소 → (Entropy) 격리증거금 $1 추가 → 청산까지
+# 5) 주문 기능 점검: 최소 금액(약 $12)으로 실제 주문 → 대조 → 취소, --fill 이면 진입 → 손절 → 격리증거금 $1 추가 → 청산
 .venv/bin/hedgebot selftest --mode live --fill --i-understand-live
 
 # 6) 24시간 실행 (재부팅·오류 시 자동 재시작)
@@ -156,46 +170,33 @@ journalctl -u hedgebot -f              # 실시간 로그 (Ctrl+C 로 빠져나�
 
 | 할 일 | 명령 |
 |---|---|
-| 상태 보기 | `.venv/bin/hedgebot status`, `.venv/bin/hedgebot report --hours 24` |
-| 멈추기 | `sudo systemctl stop hedgebot` (메이커 주문 취소, 포지션과 거래소 손절은 그대로) |
+| 상태 보기 | `.venv/bin/hedgebot status`, `.venv/bin/hedgebot report --hours 72` |
+| **한 달에 한 번: 헤지 비율 점검** | `.venv/bin/hedgebot pairs` (5장 아래) |
+| 멈추기 | `sudo systemctl stop hedgebot` (걸린 주문 취소, 포지션과 거래소 손절은 그대로) |
 | 다시 켜기 | `sudo systemctl start hedgebot` (실제 포지션을 읽어 이어서 진행) |
+| 손실 한도로 멈췄을 때 | `sudo systemctl stop hedgebot && .venv/bin/hedgebot resume && sudo systemctl start hedgebot` |
 | 업데이트 | `git pull && .venv/bin/pip install -e . && sudo systemctl restart hedgebot` |
-| 리밸런싱 금액 | `.venv/bin/hedgebot rebalance` |
 | 비상 전체 청산 | `sudo systemctl stop hedgebot && .venv/bin/hedgebot flatten --mode live --confirm --i-understand-live` |
 
-`selftest`와 `flatten`은 봇이 돌고 있으면 실행을 거부합니다(먼저 `sudo systemctl stop hedgebot`).
-설치 스크립트가 만드는 `config.yaml`은 `mode: live`입니다. 모의 거래(`--mode paper`)는 별도 저널(`data/journal-paper.sqlite`)을 써서 실전 상태와 섞이지 않습니다.
+모의 거래: `hedgebot run --mode paper` (키 없이 실시세, 별도 기록 `data/journal-paper.sqlite`).
 
-### 자금을 더 넣을 때 (설정 수정 필요 없음)
+### 헤지 비율 점검 (`hedgebot pairs`)
 
-`sizing.scale_with_equity: true`(기본)면 모든 페어 크기가 **실제 잔고 합계 ÷ `capital` 합계** 배수로 자동 조정됩니다.
-
-- `capital`은 1배 기준값입니다(기본 $18k). 잔고가 $36k가 되면 모든 포지션 목표가 2배가 됩니다.
-- **입금**: 늘어난 잔고가 30분 유지되면 크기를 키웁니다. 텔레그램으로 "position size x1.00 -> x2.00"이 옵니다.
-- **세 곳 모두 비율대로 넣으세요** (Arcus : trade.xyz : Entropy = 8 : 2 : 8). 크기는 `capital` 대비 돈이 가장 적은 거래소 배수까지만 커집니다.
-  한 곳에만 넣으면 커지지 않고 "○○ only x1.00: move money there" 알림이 옵니다. 그 금액을 옮기면 커집니다.
-- **거래소 간 이체 중**에는 잔고 합계가 잠깐 줄어 보입니다. 감소는 6시간 넘게 이어질 때만 반영되므로 이체 때문에 포지션을 줄이지 않습니다.
-  일일 손실 한도(2%)도 이체를 손실로 보지 않습니다. 포지션이 그대로인 거래소에서 가격 변동으로 설명되지 않는 잔고 변화를 이체로 처리하고,
-  봇이 꺼져 있는 동안 옮긴 돈도 재시작 후 똑같이 처리합니다. 청산·손절처럼 포지션이 바뀌는 손실은 그대로 손실로 셉니다.
-- **출금**: 줄어든 잔고가 6시간 유지되면 크기를 줄입니다.
-- 클립 크기($600~2,000)는 그대로라서 크기가 커지면 다 쌓는 데 시간이 더 걸립니다. 하루 비용 예산은 배수만큼 같이 늘어납니다.
-- 배수 범위는 0.25~10배(`sizing.min_scale / max_scale`)입니다. 3배 이상 키울 때는 `hedgebot scan`으로 Entropy 종목의 거래량과 OI를 먼저 보세요.
-
-## 4. 그 밖의 사용법
-
-```bash
-hedgebot scan                          # Arcus RWA ↔ trade.xyz / Entropy 공통 종목, 펀딩비, 스프레드, 레버리지 한도
-hedgebot backtest --days 45            # config.yaml 기준 (백테스트는 고정 크기)
-hedgebot backtest --days 45 --sweep    # 회전 주기·규모·헤지 방식 비교
-hedgebot run --mode paper              # 키 없이 실시세 모의 거래
-hedgebot rebalance --apply             # paper 모드에서만: 모의 잔고에 이체 반영
 ```
-백테스트 옵션: `--half-spread arcus=0.3:0.5,hl:xyz=0.3:0.5,hl:io=0.8:1.2`, `--passive-hedge-fill-rate 0.5`,
-`--points-per-musd 33`, `--no-transfers`, `--rebalance-every-h 72`.
-`paper.maker_fill: through`(기본)는 가격이 내 호가를 **뚫고 지나가야** 체결로 보는 보수적인 설정입니다.
+pair       window   corr  maker vol  hedge vol ratio now suggested  book vol now  suggested
+MEM-US        90d   0.91        77%        96%      0.80      0.80         18.2%      18.2%
+MEM-KR        90d   0.93        90%        54%      1.60      1.67         12.8%      12.6%
+```
 
-테스트넷: Entropy(io)는 Hyperliquid 테스트넷에 없고, Arcus 테스트넷은 호가 간격이 수 %라서 전략 테스트에는 맞지 않습니다.
-주문 기능 확인은 위 `selftest`(실전, 최소 금액)로 합니다.
+- `suggested`가 60~90일 기준으로 지금 값과 15% 넘게 차이 나면 `config.yaml`의 `hedge_notional_ratio`를 바꾸고 재시작하세요.
+  새 값은 다음 회전(전부 닫았다 다시 쌓을 때)부터 쓰입니다.
+- `corr`이 0.8 밑으로 떨어지면 그 페어는 헤지가 잘 안 되는 상태입니다. 크기를 줄이거나 끄세요(`enabled: false`).
+
+### 자금을 더 넣을 때
+
+`sizing.scale_with_equity: true`(기본)면 모든 페어가 **Entropy 잔고 ÷ `capital.hl:io`($18k)** 배수로 자동 조정됩니다.
+$36k가 되면 모든 페어가 2배. 입금은 30분, 출금은 6시간 유지되면 반영합니다. 3배 이상 키울 때는 EWY 호가가 얇다는 점
+(10bp 안에 약 $12k)을 감안하세요.
 
 ---
 
@@ -203,21 +204,14 @@ hedgebot rebalance --apply             # paper 모드에서만: 모의 잔고에
 
 | 변수 | 내용 | 권한 |
 |---|---|---|
-| `ARCUS_API_PRIVKEY` | app.arcus.xyz/api-keys 에서 Generate 한 **API Signing Key** (64자리 hex) | 거래 전용, 출금 불가 |
-| `ARCUS_ETH_ADDRESS` | 그 키를 등록한 지갑 주소 | |
 | `HL_ACCOUNT_ADDRESS` | Hyperliquid **메인 지갑 주소** (잔고가 있는 주소) | |
-| `HL_AGENT_PRIVKEY` | app.hyperliquid.xyz/API 에서 Generate 한 **API 지갑 개인키** | 거래 전용, 출금 불가 |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | 알림 (강력 권장: 경고·리밸런싱·크기 변경을 받는 유일한 통로) | |
+| `HL_AGENT_PRIVKEY` | app.hyperliquid.xyz/API 에서 Generate 한 **API 지갑 개인키** | 거래 전용, 출금·이체 불가 |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | 알림 (강력 권장: 손실 한도·보충·손절 알림을 받는 유일한 통로) | |
 
-- 키는 `.env`에만 두세요(설치 스크립트가 본인만 읽을 수 있게 권한 600으로 만듭니다). `.env`는 git에 올라가지 않습니다.
-- **키에는 만료일이 있습니다.** Arcus API 키는 최대 180일, Hyperliquid API 지갑도 유효기간을 정해 발급합니다.
-  발급할 때 가장 길게 잡고 만료 전에 새로 발급해 `.env`를 바꾼 뒤 `sudo systemctl restart hedgebot` 하세요. 만료되면 주문이 거부되고 오류 알림이 옵니다.
-- **봇 전용 계정을 쓰세요.** 봇은 시작할 때 그 계정의 미체결 주문을 모두 취소하고, 봇이 모르는 종목의 포지션은 알림만 보냅니다.
-  Arcus는 API 키 발급 화면에서 Subaccount #를 고르고 `arcus.account_index`를 같게 맞추세요.
-  Hyperliquid에서 직접 거래도 한다면 봇 전용 지갑(새 주소)을 따로 만들어 쓰세요(봇은 HL 서브계정 거래를 지원하지 않습니다).
-- HL API 지갑은 거래소(dex) 간 자금 이동을 못 합니다. 이체는 웹에서 직접 하세요.
-- **Hyperliquid 계정은 Standard(수동) 모드여야 합니다.** 통합 계정(unified)·포트폴리오 마진에서는 trade.xyz·Entropy 잔고가 따로 보이지 않아
-  크기 조정·증거금 보충·손실 한도가 틀린 숫자로 돌기 때문에, 봇이 시작을 거부합니다. HL도 자동매매에는 Standard를 권장합니다.
+- Arcus 키는 필요 없습니다(비워 두세요).
+- 키는 `.env`에만 두세요(권한 600). `.env`는 git에 올라가지 않습니다. API 지갑에는 유효기간이 있으니 만료 전에 새로 발급해 바꾸고 재시작하세요.
+- **봇 전용 지갑을 쓰세요.** 봇은 시작할 때 그 계정의 미체결 주문을 모두 취소하고, 봇이 모르는 Entropy 포지션은 알림만 보냅니다.
+- **Hyperliquid 계정은 Standard(수동) 모드여야 합니다.** 통합 계정에서는 Entropy 잔고가 따로 보이지 않아 봇이 시작을 거부합니다.
 
 ---
 
@@ -225,67 +219,71 @@ hedgebot rebalance --apply             # paper 모드에서만: 모의 잔고에
 
 | 키 | 기본값 | 설명 |
 |---|---|---|
-| `capital` | arcus 8000 / hl:xyz 2000 / hl:io 8000 | 크기의 1배 기준 + 리밸런싱 비율 (paper에서는 모의 잔고). RWA 약 22% / io 약 78% |
-| `sizing.scale_with_equity` | true | 실제 잔고 합계 ÷ `capital` 합계만큼 모든 페어 크기를 자동 조정 (늘 때 30분, 줄 때 6시간 유지 확인, 0.25~10배) |
-| `arcus.dead_mans_switch_s` | 0 (끔) | 켜면(5~300초) 봇이 멈췄을 때 Arcus 주문이 모두 취소되는데, Arcus 손절도 같이 사라집니다 |
-| `pairs[].notional_usd`, `leverage`, `direction` | | 페어별 명목가, 레버리지, `auto` / `long_maker` / `short_maker` |
-| `pairs[].rotate`, `min_hold_h`, `max_hold_h`, `rotation_fraction_min/max` | io: 24~48h, 30~60% | 페어별 회전 설정. `rotate: false`면 보유만 |
-| `strategy.min_hold_h / max_hold_h` | 6 / 12 | 회전 간격. 짧을수록 포인트↑ 비용↑ |
-| `strategy.rotate_when` | off_hours | Arcus 장외시간(20:00~04:00 ET, 주말)에만 회전 |
-| `strategy.max_daily_cost_usd` | 20 | 하루 수수료+슬리피지 한도 (크기 배수만큼 같이 늘어남) |
-| `strategy.basis_guard_bps` | 8 | 두 거래소 가격 차이가 평소보다 이만큼 불리하면 대기 |
-| `execution.hedge_mode` | passive_first | `taker`로 바꾸면 즉시 테이커 헤지 |
-| `risk.margin_ratio_warn / critical` | 3.0 / 1.7 | 자산÷유지증거금. 경고(입금 안내) / 자동 30% 축소 |
-| `risk.max_daily_loss_pct` | 2 | 초과 시 신규 진입·회전 중단 |
-| `risk.backstop_margin_ratio` | 1.25 | 거래소 손절 위치 (교차증거금 계정 기준) |
-| `risk.backstop_isolated_buffer_pct` | 2 | 격리 포지션 손절: 청산가 몇 % 앞 |
-| `risk.stop_cooldown_h` | 6 | 한쪽이 닫힌 뒤 재진입까지 대기. 0이면 자동 재진입 안 함 |
-| `risk.isolated_topup_enabled / target_pct` | true / 15 | Entropy 포지션이 청산가 8% 이내면 여유 잔고로 보충해 15%로 되돌림 |
-| `rebalance.enabled / every_h / venues` | true / 72 / arcus, hl:io | 정기 리밸런싱 알림. `capital` 비율로 다시 나눈 이체 금액을 텔레그램으로 알림 |
+| `capital.hl:io` | 18000 | 크기의 1배 기준(paper에서는 모의 잔고) |
+| `pairs[].notional_usd` | 12000 / 5600 | 메이커 다리 금액. 페어 전체 = `notional_usd × (1 + hedge_notional_ratio)` |
+| `pairs[].hedge_notional_ratio` | 0.8 / 1.6 | 메이커 $1당 헤지 금액(변동성 비율). 같은 거래소의 두 종목 페어에는 필수 |
+| `pairs[].leverage` | 5 / 3 | 교차 다리는 증거금 사용량만, 격리 다리는 청산까지 거리(3배 ≈ 30%)를 정함 |
+| `strategy.min_hold_h / max_hold_h` | 66 / 78 | 회전 간격 |
+| `strategy.rotation_fraction_min/max` | 1.0 / 1.0 | 회전 때 닫는 비율. 1.0이면 전부 닫고 새 비율·새 방향으로 다시 쌓음 |
+| `strategy.rotate_when` | us_session | 미국 정규장에만 회전 (`any` = 아무 때나) |
+| `strategy.max_daily_cost_usd` | 40 | 하루 수수료+슬리피지 한도 (크기 배수만큼 같이 늘어남) |
+| `execution.hedge_mode` | passive_first | `taker`면 즉시 테이커 (비용 약 3배) |
+| `risk.max_daily_loss_pct` | 3 | 초과 시 그날 신규 진입·회전 중단 |
+| `risk.drawdown_warn_pct / max_drawdown_pct` | 12 / 25 | 최고점 대비 손실: 알림 / 전부 닫고 멈춤 (0 = 끔) |
+| `risk.isolated_topup_enabled / target_pct` | true / 15 | 격리 다리가 청산가 8% 이내면 여유 잔고로 15%까지 보충 |
+| `risk.backstop_isolated_buffer_pct` | 2 | 격리 다리 거래소 손절: 청산가 2% 앞 |
+| `risk.max_account_leverage` | 4 | 계정 전체 명목가 / 자산 상한 |
 
 ---
 
-## 7. 실제 서버에서 확인한 것과 남은 것
+## 7. 그 밖의 명령
 
-버리는 지갑(잔고 없음)으로 실제 거래소에 서명된 요청을 보내 확인했습니다(2026-10-25).
+```bash
+hedgebot pairs                                   # 헤지 비율·상관 점검 (30/60/90일)
+hedgebot backtest --days 112 --interval 1h --price-proxy hl:io=hl:xyz          # config.yaml 기준
+hedgebot backtest --days 112 --interval 1h --price-proxy hl:io=hl:xyz --sweep  # 회전 주기·크기·헤지 방식 비교
+hedgebot run --mode paper                        # 키 없이 실시세 모의 거래
+hedgebot resume                                  # 손실 한도 정지 해제 (봇을 멈춘 상태에서)
+```
 
-| 항목 | 결과 |
-|---|---|
-| Arcus 테스트넷: API 키 등록, 주문(서명·가격·수량 변환), 거래소 기록 대조, 취소, 손절(positionTpsl), 레버리지, 전체 취소, 계정·미체결·체결 조회 | 통과 |
-| Arcus 데드맨 스위치 | 15초 뒤 미체결 주문 취소 확인. **손절도 같이 취소됨** → 기본 끔 |
-| Arcus "걸린 주문만 취소" (비상 청산 전) | 메이커 주문만 취소되고 손절은 남는 것 확인 |
-| Hyperliquid 메인넷·테스트넷: 주문·레버리지·트리거 손절·격리증거금 서명 (서버가 복원한 서명자 = 지갑 주소) | 통과 |
-| HIP-3 종목 매핑 (xyz:NVDA → 110002, io:SNDK → 200002) | 공개 메타데이터와 일치 |
+백테스트 옵션: `--half-spread hl:io=2.0:3.5`(정규장:장외 bp), `--passive-hedge-fill-rate 0.5`, `--seed N`.
+`--interval 15m`은 최근 약 50일까지만 데이터가 있습니다.
 
-아직 실제로 확인하지 못한 것 (잔고가 있어야 함): 실제 체결, 체결 후 포지션·청산가 읽기, Entropy 격리증거금 추가.
-처음 실전에서 `hedgebot selftest --mode live --fill`이 바로 이 부분을 최소 금액으로 확인합니다.
-
-그 밖에:
-
-1. **Arcus 퍼프 접근 권한**: 화이트리스트에 없는 주소는 API가 `address not on access whitelist`를 반환합니다. `hedgebot check`로 확인하세요.
-2. **HIP-3 수수료**: trade.xyz·Entropy 종목 대부분이 Growth mode(수수료 90% 할인)라는 공개 정보로 계산했습니다. 실거래에서는 10분마다 실제 체결 수수료를 받아 저널에 기록합니다(`report`의 reconciled fees).
-3. **포인트**: 공식 계산식은 비공개입니다. 리포트의 포인트 추정치는 `points.arcus_points_per_musd` 가정입니다. 매주 수요일 실제 배분과 비교해 보정하세요(`hedgebot report --points-per-musd X`).
-4. **교차증거금 손절 위치**: 모든 종목이 같이 움직인다고 가정해 잡습니다(청산 쪽으로 보수적). 한 종목만 크게 움직이면(SNDK 하루 ±13% 등) 봇의 축소보다 먼저 그 종목의 Arcus 손절이 나갈 수 있고, 봇이 반대쪽을 정리한 뒤 6시간 쉬고 다시 쌓습니다.
+Arcus 페어(예전 구조)도 코드에는 그대로 남아 있습니다. `pairs`에 Arcus 다리를 넣으면 예전처럼 동작합니다.
 
 ---
 
-## 8. 구조
+## 8. 확인한 것과 남은 것
+
+- **실시세 모의 거래(2026-11-16)**: 두 페어가 약 1분 만에 목표까지 쌓였고, 헤지 금액이 설정 비율과 일치
+  (DRAM $11.96k 숏 / SNDK $9.57k 롱 = 0.80, SKHX $5.58k 롱 / EWY $8.94k 숏 = 1.60). 격리 다리 거래소 손절이 청산가 2% 앞에 걸림.
+- 테스트 124개 통과 (같은 거래소 두 종목 페어의 헤지 비율·회전·재시작, 손실 한도 정지·유지·출금 구분, 백테스트 포함).
+- 이전에 확인된 것: Hyperliquid 주문·레버리지·트리거 손절·격리증거금 서명, HIP-3 종목 매핑.
+
+아직 실전에서 확인하지 못한 것: Entropy에서 실제 체결, 격리증거금 실제 추가. 첫 실전의 `hedgebot selftest --mode live --fill`이
+최소 금액으로 이 부분을 확인합니다. 실전 첫 회전(약 3일 뒤)도 `journalctl -u hedgebot`으로 지켜보세요.
+
+---
+
+## 9. 구조
 
 ```
 hedgebot/
-  venues/arcus.py        Arcus REST (Ed25519 서명: 주문 typed payload / 레거시 메시지)
   venues/hyperliquid.py  HIP-3 dex별 계정 (공식 SDK + API 지갑)
-  venues/paper.py        실시세 기반 모의 체결 (수수료·펀딩·증거금·청산 시뮬레이션)
-  executor.py            페어 상태 머신: BUILD → HOLD → UNWIND, 메이커 클립 + 헤지 + 불균형 수리
-  risk.py                계정 증거금 비율, 격리 청산 거리, 일일 손실 한도
-  backstop.py            거래소에 걸어 두는 손절 주문 관리
-  rebalance.py           거래소 간 리밸런싱 이체 계산
-  strategy.py            방향·회전·베이시스·사이징 규칙 (실거래와 백테스트가 공유)
-  engine.py              메인 루프, 시작·종료, 잔고 비례 크기, 스냅샷, 수수료 대조, 비상 청산
-  sizing.py              입금·출금에 맞춘 크기 배수 (늘 때 30분, 줄 때 6시간 유지 확인)
-  selftest.py            실전 최소 금액 주문 점검
-  backtest/              과거 캔들·펀딩 재생 시뮬레이터
-  scanner.py, report.py, journal.py, cli.py
+  venues/paper.py        실시세 기반 모의 체결 (수수료·펀딩·증거금·청산)
+  venues/arcus.py        Arcus REST (예전 구조용)
+  executor.py            페어 상태 머신: BUILD → HOLD → UNWIND. 메이커 클립 + 헤지 + 불균형 수리.
+                         두 종목 페어는 금액 비율로 헤지하고, 비율은 전부 닫혔을 때 그날 가격으로 다시 정함
+  risk.py                증거금 비율, 격리 청산 거리·자동 보충, 일일 손실, 최고점 대비 손실 한도
+  backstop.py            거래소에 걸어 두는 손절 주문
+  strategy.py            방향·회전·회전 시간대·사이징 규칙 (실거래와 백테스트가 공유)
+  pairstats.py           두 다리의 상관·변동성 비율 (hedgebot pairs)
+  engine.py              메인 루프, 시작·종료, 잔고 비례 크기, 손실 한도 정지, 비상 청산
+  backtest/              과거 캔들·펀딩 재생 (다른 거래소 같은 종목으로 상장 전 기간 채우기)
+  sizing.py, rebalance.py, selftest.py, scanner.py, report.py, journal.py, cli.py
 deploy/                  install.sh (VPS 설치), hedgebot.service (systemd)
-tests/                   110개 (서명, 체결, 헤지 실패·장애, 불균형, 회전, 리스크, 거래소 손절, 크기 배수, 엔진, 백테스트)
+tests/                   124개
 ```
+
+참고: [Entropy 시장 데이터 (loris.tools)](https://loris.tools/hip3/io), [DefiLlama Entropy](https://defillama.com/rwa/perps/venue/entropy),
+[airdropalert Entropy (포인트 미확정)](https://airdropalert.com/airdrops/entropy/).

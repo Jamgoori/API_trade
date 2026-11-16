@@ -5,6 +5,9 @@
   it orders every pair on that venue to cut `derisk_fraction` with IOCs on both legs.
 - Isolated positions (Entropy is isolated-only): distance from mark to the
   liquidation price, same warn / critical ladder.
+- Drawdown: total equity versus its high-water mark (cash moves excluded the same way). Past
+  `drawdown_warn_pct` it alerts; past `max_drawdown_pct` the engine closes every pair and stays
+  flat until `hedgebot resume`.
 - Daily loss: total equity across all venues versus the UTC day start (kept across restarts).
   Breaching `max_daily_loss_pct` halts new risk and rotations (hedged positions are kept).
   Deposits, withdrawals and transfers between venues move the baseline instead of counting as
@@ -45,6 +48,8 @@ class RiskManager:
         self.last_view: dict[str, tuple[Decimal, dict[str, tuple[Decimal, Decimal]]]] = {}
         self.view_saved_ts = 0.0
         self.topup_next: dict[tuple[str, str], float] = {}
+        self.hwm: Decimal | None = None  # equity high-water mark, adjusted for cash moves
+        self.hwm_saved: tuple[Decimal | None, float] = (None, 0.0)
 
     def _pairs_on(self, venue: str) -> list[str]:
         return [p.name for p in self.cfg.pairs if p.enabled and venue in (p.maker.venue, p.hedge.venue)]
@@ -120,7 +125,8 @@ class RiskManager:
                                       f"{name} {symbol}: {distance:.1f}% from liquidation - add margin", venue=name,
                                       pair=pair, notify=True, throttle_key=f"lwarn:{name}:{symbol}", throttle_s=3600)
         if complete:  # a missing venue would look like a loss
-            self._daily_loss(total, accounts, now)
+            moved = self._daily_loss(total, accounts, now)
+            self._drawdown(total, moved, now)
 
     def _top_up(self, venue_name: str, acct, pos, pair: str) -> bool:
         """Push the liquidation price of an isolated position back to `isolated_topup_target_pct`.
@@ -175,24 +181,28 @@ class RiskManager:
             moved += equity - prev_equity - price_pnl
         return moved
 
-    def _daily_loss(self, total: Decimal, accounts: dict, now: float) -> None:
+    def _daily_loss(self, total: Decimal, accounts: dict, now: float) -> Decimal:
+        """Daily-loss halt. Returns the cash that moved since the last check (deposits are positive)."""
         key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         journal = getattr(self.engine, "journal", None)
         if self.day_key is None and journal is not None:
             saved = journal.load_pair_state("__risk__") or {}
+            # the last view is valid on any day: money moved while the bot was stopped is not a loss
+            self.last_view = {v: (Decimal(eq), {s: (Decimal(a), Decimal(b)) for s, (a, b) in pos.items()})
+                              for v, (eq, pos) in (saved.get("view") or {}).items()}
             if saved.get("day") == key:
                 self.day_key, self.day_start_equity = key, Decimal(saved["start_equity"])
-                self.last_view = {v: (Decimal(eq), {s: (Decimal(a), Decimal(b)) for s, (a, b) in pos.items()})
-                                  for v, (eq, pos) in (saved.get("view") or {}).items()}
         moved = self._cash_moved(accounts)
+        if total > 0 and abs(moved) / total * 100 < TRANSFER_STEP_PCT:
+            moved = ZERO  # funding and rounding, not money moving
         self.last_view = {name: self._view(acct) for name, acct in accounts.items()}
         if key != self.day_key or self.day_start_equity is None or self.day_start_equity <= 0:
             self.day_key, self.day_start_equity = key, total
             self._save_day(journal, now)
             if self.engine.halted and self.engine.halt_reason == "daily loss":
                 self.engine.resume("new UTC day")
-            return
-        if total > 0 and abs(moved) / total * 100 >= TRANSFER_STEP_PCT:
+            return moved
+        if moved:
             self.day_start_equity += moved
             self._save_day(journal, now)
             log.info("cash moved %+.0f (deposit / withdrawal / transfer): daily-loss baseline now %.0f",
@@ -206,6 +216,32 @@ class RiskManager:
                                            f"(${self.day_start_equity:,.0f} -> ${total:,.0f})")
         elif self.engine.halted and self.engine.halt_reason == "daily loss" and loss_pct < limit / 2:
             self.engine.resume(f"equity back to {-loss_pct:+.2f}% of the day start")
+        return moved
+
+    def _drawdown(self, total: Decimal, moved: Decimal, now: float) -> None:
+        r = self.cfg.risk
+        if (r.max_drawdown_pct <= 0 and r.drawdown_warn_pct <= 0) or total <= 0:
+            return
+        journal = getattr(self.engine, "journal", None)
+        if self.hwm is None:
+            saved = (journal.load_pair_state("__drawdown__") or {}) if journal is not None else {}
+            self.hwm = Decimal(saved["hwm"]) + moved if saved.get("hwm") else total
+        else:
+            self.hwm += moved  # a withdrawal lowers the mark, a deposit raises it
+        self.hwm = max(self.hwm, total)
+        dd = (self.hwm - total) / self.hwm * 100 if self.hwm > 0 else ZERO
+        if journal is not None and (self.hwm != self.hwm_saved[0] and now - self.hwm_saved[1] >= VIEW_SAVE_S
+                                    or moved):
+            journal.save_pair_state("__drawdown__", {"hwm": str(self.hwm), "ts": now})
+            self.hwm_saved = (self.hwm, now)
+        detail = f"equity {dd:.1f}% below its peak (${self.hwm:,.0f} -> ${total:,.0f})"
+        if r.max_drawdown_pct > 0 and dd >= r.max_drawdown_pct:
+            if not getattr(self.engine, "drawdown_stopped", False):
+                self.engine.drawdown_stop(detail)
+        elif r.drawdown_warn_pct > 0 and dd >= r.drawdown_warn_pct:
+            limit = f"; at {r.max_drawdown_pct}% the bot closes every pair" if r.max_drawdown_pct > 0 else ""
+            self.engine.event("warning", "drawdown", detail + limit, notify=True, throttle_key="drawdown",
+                              throttle_s=6 * 3600)
 
     def _save_day(self, journal, now: float) -> None:
         self.view_saved_ts = now

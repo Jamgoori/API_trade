@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hedgebot"
 version = "0.1.0"
-description = "Arcus <-> Hyperliquid HIP-3 (trade.xyz / Entropy) delta-neutral points farming bot"
+description = "Hedged points farming bot for Hyperliquid HIP-3 (Entropy) and Arcus"
 requires-python = ">=3.11"
 dependencies = [
     "hyperliquid-python-sdk==0.24.0",

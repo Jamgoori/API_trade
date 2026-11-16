@@ -73,16 +73,27 @@ def build_report(journal: Journal, cfg: Config, start: float | None = None, end:
             actual[f["venue"]] += D(f["fee"] or 0)
         lines.append("    reconciled venue fees: " + ", ".join(f"{v} ${x:,.2f}" for v, x in sorted(actual.items())))
 
+    # open interest: average gross notional per venue over the snapshots (what OI-based points count)
+    oi = defaultdict(list)
+    for snap in snaps:
+        oi[snap["venue"]].append(D(snap["gross_notional"] or 0))
+    if oi:
+        lines += ["", "  Open interest (average of snapshots, both legs)"]
+        for v in sorted(oi):
+            lines.append(f"    {v:<8} ${sum(oi[v], ZERO) / len(oi[v]):>12,.0f}   volume/day "
+                         f"${vol.get(v, ZERO) / D(hours) * 24:>10,.0f}")
+
     arcus_vol = vol.get("arcus", ZERO)
-    rate = D(points_override) if points_override is not None else cfg.points.arcus_points_per_musd
-    points = arcus_vol / Decimal(1_000_000) * rate
-    cost = sum(fee.values(), ZERO) + sum((max(ZERO, x) for x in slip.values()), ZERO)
-    weekly = f" (~{points / D(hours) * 168:,.1f}/week)" if hours >= 24 else " (run >= 24h for a weekly rate)"
-    lines += ["", "  Points (estimate)",
-              f"    Arcus volume ${arcus_vol:,.0f} -> ~{points:,.1f} points at {rate} pts/$1M{weekly}"]
-    if points > 0:
-        lines.append(f"    execution cost per point ${cost / points:,.2f}; equity change per point "
-                     f"${-(total_end - total_start) / points:,.2f}")
+    if arcus_vol > 0:
+        rate = D(points_override) if points_override is not None else cfg.points.arcus_points_per_musd
+        points = arcus_vol / Decimal(1_000_000) * rate
+        cost = sum(fee.values(), ZERO) + sum((max(ZERO, x) for x in slip.values()), ZERO)
+        weekly = f" (~{points / D(hours) * 168:,.1f}/week)" if hours >= 24 else " (run >= 24h for a weekly rate)"
+        lines += ["", "  Arcus points (estimate)",
+                  f"    Arcus volume ${arcus_vol:,.0f} -> ~{points:,.1f} points at {rate} pts/$1M{weekly}"]
+        if points > 0:
+            lines.append(f"    execution cost per point ${cost / points:,.2f}; equity change per point "
+                         f"${-(total_end - total_start) / points:,.2f}")
 
     # execution quality
     kinds = Counter(e["kind"] for e in events)

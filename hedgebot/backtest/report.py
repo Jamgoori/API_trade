@@ -32,15 +32,23 @@ def format_result(res: BacktestResult) -> str:
         f"      fees                 {_money(-res.fees)}",
         f"      spread/slippage      {_money(-res.slippage)}",
         f"      basis & other        {_money(res.basis_and_other)}",
-        f"    Arcus (maker) volume   ${res.maker_volume:,.0f}  (${res.maker_volume / days:,.0f}/day,"
-        f" off-hours {res.maker_volume_off_hours / res.maker_volume:.0%})" if res.maker_volume else
-        "    Arcus (maker) volume   $0",
-        f"    hedge volume           ${res.hedge_volume:,.0f}",
-        f"    open interest          ${res.oi_hours / (days * 24):,.0f} average maker-leg notional",
-        f"    est. Arcus points      {res.est_points:,.1f}  ({res.est_points / days * 7:,.1f}/week at "
-        f"{p.points_per_musd:g} pts per $1M)",
-        f"    cost per point         " + (f"${res.cost_per_point:,.2f}" if res.cost_per_point is not None else "n/a")
-        + ("  (net positive: farming paid for itself)" if res.cost_per_point is not None and res.cost_per_point < 0 else ""),
+        f"    max drawdown           {_money(-res.max_drawdown_usd)}  ({res.max_drawdown_pct:.1f}% of peak equity)",
+    ]
+    for v in res.start_equity:
+        lines.append(f"    {v:<22} volume ${res.venue_volume_per_day(v):,.0f}/day (both legs), "
+                     f"average OI ${res.venue_avg_oi(v):,.0f}")
+    if "arcus" in res.start_equity:
+        lines += [
+            f"    Arcus (maker) volume   ${res.maker_volume:,.0f}  (${res.maker_volume / days:,.0f}/day,"
+            f" off-hours {res.maker_volume_off_hours / res.maker_volume:.0%})" if res.maker_volume else
+            "    Arcus (maker) volume   $0",
+            f"    est. Arcus points      {res.est_points:,.1f}  ({res.est_points / days * 7:,.1f}/week at "
+            f"{p.points_per_musd:g} pts per $1M)",
+            f"    cost per point         " + (f"${res.cost_per_point:,.2f}" if res.cost_per_point is not None else "n/a")
+            + ("  (net positive: farming paid for itself)" if res.cost_per_point is not None and res.cost_per_point < 0
+               else ""),
+        ]
+    lines += [
         f"    rotations / flips      {res.rotations} / {sum(r.flips for r in res.pairs.values())}",
         f"    de-risk / stops / liq  {res.derisks} / {res.stops} / {res.liquidations}",
         f"    min margin ratio       " + ", ".join(f"{v} {r:.2f}" for v, r in res.min_margin_ratio.items()),
@@ -64,7 +72,7 @@ def format_result(res: BacktestResult) -> str:
         groups.setdefault(res.groups.get(name) or "-", []).append(r)
     if len(groups) > 1 or "-" not in groups:
         lines.append("")
-        lines.append("  Per group (volume per day: Arcus leg / hedge leg)")
+        lines.append("  Per group (volume per day: maker leg / hedge leg)")
         for g, rs in groups.items():
             mv = sum(r.maker_volume for r in rs) / days
             hv = sum(r.hedge_volume for r in rs) / days
@@ -82,13 +90,13 @@ def format_result(res: BacktestResult) -> str:
 
 
 def format_sweep(results: list[BacktestResult]) -> str:
-    header = (f"{'variant':<28}{'net PnL':>11}{'$/day':>9}{'vol/day':>11}{'pts/wk':>8}{'$/pt':>8}"
+    """vol/day and avg OI count both legs on every venue; costs = fees + spread - funding."""
+    header = (f"{'variant':<28}{'net PnL':>10}{'costs':>9}{'vol/day':>10}{'avg OI':>10}{'max DD':>9}{'DD%':>6}"
               f"{'derisk':>7}{'stop':>5}{'liq':>4}{'xfer':>5}{'min MR':>8}")
     lines = [header, "-" * len(header)]
     for r in results:
-        cpp = f"{r.cost_per_point:,.2f}" if r.cost_per_point is not None else "n/a"
         mr = min((x for x in r.min_margin_ratio.values() if x == x), default=float("nan"))
-        lines.append(f"{r.params.label:<28}{r.net_pnl:>11,.0f}{r.net_pnl / r.days:>9,.1f}"
-                     f"{r.maker_volume / r.days:>11,.0f}{r.est_points / r.days * 7:>8,.1f}{cpp:>8}"
-                     f"{r.derisks:>7}{r.stops:>5}{r.liquidations:>4}{r.transfers:>5}{mr:>8.2f}")
+        lines.append(f"{r.params.label:<28}{r.net_pnl:>10,.0f}{r.fees + r.slippage - r.funding:>9,.0f}"
+                     f"{r.total_volume / r.days:>10,.0f}{r.total_avg_oi:>10,.0f}{r.max_drawdown_usd:>9,.0f}"
+                     f"{r.max_drawdown_pct:>6.1f}{r.derisks:>7}{r.stops:>5}{r.liquidations:>4}{r.transfers:>5}{mr:>8.2f}")
     return "\n".join(lines)

@@ -18,9 +18,9 @@ def write(tmp_path, text):
 
 def test_example_config_loads():
     cfg = load_config("config.example.yaml")
-    assert cfg.venues_needed() == ["arcus", "hl:xyz", "hl:io"]
-    assert cfg.capital["hl:io"] == Dd(8000)
-    assert {p.group for p in cfg.pairs} == {"rwa", "io"}
+    assert cfg.venues_needed() == ["hl:io"]
+    assert cfg.capital == {"hl:io": Dd(18000)}
+    assert {p.group for p in cfg.pairs} == {"us", "kr"}
     assert cfg.execution.hedge_mode == "passive_first"
 
 

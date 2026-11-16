@@ -1,4 +1,4 @@
-"""Command line entry point: scan | backtest | run | report | status | check | selftest | rebalance | flatten."""
+"""Command line entry point: scan | backtest | pairs | run | report | status | check | selftest | resume | flatten..."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ log = logging.getLogger("hedgebot")
 
 INTERVAL_MS = {"5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000}
 # Half-spreads in bps (RTH, off-hours), calibrated from live `hedgebot scan` books on large caps.
-DEFAULT_HALF_SPREAD = {"arcus": (0.3, 0.5), "hl:xyz": (0.3, 0.5), "hl:io": (0.8, 1.2)}
+DEFAULT_HALF_SPREAD = {"arcus": (0.3, 0.5), "hl:xyz": (0.3, 0.5), "hl:io": (2.0, 3.5)}
 
 
 LOG_FORMAT = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -102,6 +102,23 @@ def _leg_specs(cfg: Config, venues, half_spread: dict[str, tuple[float, float]])
     return specs
 
 
+def _proxy_venues(text: str | None, cfg: Config) -> dict:
+    """--price-proxy hl:io=hl:xyz: history of the same stock on another HIP-3 dex before Entropy listed it."""
+    if not text:
+        return {}
+    from .venues.hyperliquid import HyperliquidClient, HyperliquidVenue
+
+    out = {}
+    for part in text.split(","):
+        venue, _, proxy = (x.strip() for x in part.partition("="))
+        if not (venue.startswith("hl:") and proxy.startswith("hl:")):
+            raise SystemExit("--price-proxy takes Hyperliquid dexes, e.g. hl:io=hl:xyz")
+        client = HyperliquidClient("mainnet", dexes=[proxy[3:]])
+        out[venue] = HyperliquidVenue(client, proxy[3:], base_maker_fee=cfg.hyperliquid.base_maker_fee,
+                                      base_taker_fee=cfg.hyperliquid.base_taker_fee)
+    return out
+
+
 def _parse_half_spread(text: str | None) -> dict[str, tuple[float, float]]:
     out = dict(DEFAULT_HALF_SPREAD)
     if text:
@@ -126,13 +143,16 @@ def cmd_backtest(args) -> int:
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - int(args.days * 86_400_000)
     pairs = [p for p in cfg.pairs if p.enabled]
-    datas = [load_pair_data(p, venues, args.interval, INTERVAL_MS[args.interval], start_ms, end_ms, args.cache_dir)
-             for p in pairs]
+    proxies = _proxy_venues(args.price_proxy, cfg)
+    datas = [load_pair_data(p, venues, args.interval, INTERVAL_MS[args.interval], start_ms, end_ms, args.cache_dir,
+                            proxies) for p in pairs]
     for d in datas:
         if len(d.maker) == 0 or len(d.hedge) == 0:
             raise SystemExit(f"no history for {d.pair.name} ({len(d.maker)} / {len(d.hedge)} bars)")
+        proxied = (f" (proxy bars before listing: {d.proxy_bars[0]} / {d.proxy_bars[1]})"
+                   if any(d.proxy_bars) else "")
         print(f"{d.pair.name}: {len(d.maker)} maker bars, {len(d.hedge)} hedge bars, "
-              f"{len(d.maker_funding)} / {len(d.hedge_funding)} funding prints")
+              f"{len(d.maker_funding)} / {len(d.hedge_funding)} funding prints{proxied}")
     s, r = cfg.strategy, cfg.risk
     base = BacktestParams(
         capital={k: float(v) for k, v in cfg.capital.items()},
@@ -168,27 +188,62 @@ def cmd_backtest(args) -> int:
     variants = [
         base,
         replace(base, label="hold only (no rotation)", rotation_enabled=False),
-        replace(base, label="rotate 1.5-4h*", min_hold_h=1.5, max_hold_h=4),
-        replace(base, label="rotate 8-16h*", min_hold_h=8, max_hold_h=16),
+        replace(base, label="rotate every 8-16h*", min_hold_h=8, max_hold_h=16),
+        replace(base, label="rotate every 24-48h*", min_hold_h=24, max_hold_h=48),
+        replace(base, label="rotate every 5-7 days*", min_hold_h=120, max_hold_h=168),
+        replace(base, label="rotate 50% of it*", rotation_fraction_min=0.5, rotation_fraction_max=0.5),
         replace(base, label="rotate any time", rotate_when="any"),
         replace(base, label="notional x1.5", notional_scale=1.5),
         replace(base, label="notional x0.6", notional_scale=0.6),
-        replace(base, label="no basis guard", use_basis_guard=False),
-        replace(base, label="budget x3", max_daily_cost_usd=base.max_daily_cost_usd * 3),
-        replace(base, label="no transfers", allow_transfers=False),
         replace(base, label="no exchange stops", backstop_enabled=False),
         replace(base, label="no isolated top-up", isolated_topup_enabled=False),
         replace(base, label="taker hedge", passive_hedge_fill_rate=0.0) if base.passive_hedge_fill_rate else
         replace(base, label="passive hedge 50% fills", passive_hedge_fill_rate=0.5),
-        replace(base, label="passive hedge 50% + 8-16h*", passive_hedge_fill_rate=base.passive_hedge_fill_rate or 0.5,
-                min_hold_h=8, max_hold_h=16),
     ]
+    if len(base.capital) > 1:
+        variants.append(replace(base, label="no transfers", allow_transfers=False))
     results = [run_backtest(datas, v, start_ms, end_ms) for v in variants]
     print()
     print(format_sweep(results))
-    print("* applies to pairs without their own min_hold_h / max_hold_h in config")
+    print("* applies to pairs without their own min_hold_h / max_hold_h / rotation_fraction in config")
     print()
     print(format_result(results[0]))
+    return 0
+
+
+# --------------------------------------------------------------------- pairs
+def cmd_pairs(args) -> int:
+    from .backtest import load_pair_data
+    from .engine import build_market_venues
+    from .pairstats import daily_closes, pair_stats
+
+    cfg = _load(args)
+    cfg.mode = "live"  # mainnet history
+    venues = build_market_venues(cfg, None, trading=False)
+    for v in venues.values():
+        v.refresh_markets()
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - int((max(args.windows) + 2) * 86_400_000)
+    proxies = _proxy_venues(args.price_proxy, cfg)
+    print(f"{'pair':<10}{'window':>7}{'corr':>7}{'maker vol':>11}{'hedge vol':>11}{'ratio now':>10}"
+          f"{'suggested':>10}{'book vol now':>14}{'suggested':>11}")
+    for pair in cfg.pairs:
+        if not pair.enabled:
+            continue
+        data = load_pair_data(pair, venues, "1h", INTERVAL_MS["1h"], start_ms, end_ms, args.cache_dir, proxies)
+        maker, hedge = daily_closes(data.maker.t, data.maker.close), daily_closes(data.hedge.t, data.hedge.close)
+        ratio = float(pair.hedge_notional_ratio or pair.hedge_ratio)
+        for days in args.windows:
+            st = pair_stats(maker, hedge, ratio, days)
+            if st is None:
+                print(f"{pair.name:<10}{days:>6}d  not enough history")
+                continue
+            print(f"{pair.name:<10}{st.days:>6}d{st.correlation:>7.2f}{st.maker_vol:>11.0%}{st.hedge_vol:>11.0%}"
+                  f"{ratio:>10.2f}{st.suggested_ratio:>10.2f}{st.book_vol:>14.1%}{st.book_vol_suggested:>11.1%}")
+    print("\nratio = hedge $ per maker $ (hedge_notional_ratio). suggested = maker vol / hedge vol.\n"
+          "book vol = yearly swing of the hedged pair per $1 of gross notional (lower is a better hedge).\n"
+          "Change hedge_notional_ratio when the 60-90 day suggestion stays >15% away from it; the bot uses\n"
+          "the new value from the next full rotation. Correlation below ~0.8 means the pair hedges poorly.")
     return 0
 
 
@@ -237,7 +292,7 @@ def cmd_status(args) -> int:
     print(f"mode={cfg.mode} journal={cfg.journal_path}")
     for p in cfg.pairs:
         print(f"{p.name}: {journal.load_pair_state(p.name)}")
-    for key in ("__sizing__", "__risk__", "__rebalance__"):
+    for key in ("__sizing__", "__risk__", "__drawdown__", "__drawdown_stop__", "__rebalance__"):
         print(f"{key.strip('_')}: {journal.load_pair_state(key)}")
     snaps = journal.snapshots_between(time.time() - 3600 * 6, time.time() + 1)
     latest = {}
@@ -390,6 +445,26 @@ def cmd_rebalance(args) -> int:
     return 0
 
 
+def cmd_resume(args) -> int:
+    from .engine import DRAWDOWN_STOP_KEY, ensure_dirs
+    from .journal import Journal
+
+    cfg = _load(args)
+    ensure_dirs(cfg)
+    lock = _require_bot_stopped(cfg)  # noqa: F841  (the running bot would keep its own view)
+    journal = Journal(cfg.journal_path)
+    state = journal.load_pair_state(DRAWDOWN_STOP_KEY) or {}
+    if not state.get("stopped"):
+        print("no drawdown stop is active")
+        return 0
+    print(f"clearing the drawdown stop from {time.strftime('%Y-%m-%d %H:%M', time.localtime(state.get('ts', 0)))}: "
+          f"{state.get('detail', '')}")
+    journal.save_pair_state(DRAWDOWN_STOP_KEY, {"stopped": False, "cleared_ts": time.time()})
+    journal.save_pair_state("__drawdown__", {})  # the next start measures drawdown from the equity it finds
+    print("done. Start the bot again (sudo systemctl start hedgebot); it rebuilds the pairs.")
+    return 0
+
+
 def cmd_flatten(args) -> int:
     from .engine import Engine, ensure_dirs, flatten_all
 
@@ -406,7 +481,7 @@ def cmd_flatten(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     load_dotenv(find_dotenv(usecwd=True))  # .env next to config.yaml in the working directory
-    parser = argparse.ArgumentParser(prog="hedgebot", description="Arcus <-> Hyperliquid HIP-3 hedge points bot")
+    parser = argparse.ArgumentParser(prog="hedgebot", description="Hedged points farming bot (Entropy / HIP-3, Arcus)")
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -434,9 +509,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--points-per-musd", type=float)
     p.add_argument("--rebalance-every-h", type=float,
                    help="simulate moving money between rebalance.venues every N hours (0 = off; default: config)")
+    p.add_argument("--price-proxy", help="fill history before a market was listed from another dex with the same "
+                                          "stock, e.g. hl:io=hl:xyz")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--cache-dir", default="data/cache")
     p.set_defaults(func=cmd_backtest)
+
+    p = with_config(sub.add_parser("pairs", help="check how well each pair's legs hedge each other (hedge ratios)"))
+    p.add_argument("--windows", type=lambda x: [int(v) for v in x.split(",")], default=[30, 60, 90],
+                   help="trailing windows in days, e.g. 30,60,90")
+    p.add_argument("--price-proxy", default="hl:io=hl:xyz",
+                   help="history before Entropy listed a market, from the same stock elsewhere ('' = off)")
+    p.add_argument("--cache-dir", default="data/cache")
+    p.set_defaults(func=cmd_pairs)
 
     p = with_config(sub.add_parser("run", help="run the bot"))
     p.add_argument("--mode", choices=["paper", "testnet", "live"])
@@ -477,6 +562,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--mode", choices=["paper", "testnet", "live"])
     p.add_argument("--apply", action="store_true", help="paper mode only: apply the transfers to paper balances")
     p.set_defaults(func=cmd_rebalance)
+
+    p = with_config(sub.add_parser("resume", help="clear the drawdown stop (the bot must be stopped)"))
+    p.add_argument("--mode", choices=["paper", "testnet", "live"])
+    p.set_defaults(func=cmd_resume)
 
     p = with_config(sub.add_parser("flatten", help="emergency: close all bot positions"))
     p.add_argument("--mode", choices=["paper", "testnet", "live"])

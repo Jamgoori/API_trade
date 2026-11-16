@@ -82,6 +82,7 @@ class Runtime:
     flip_pending: bool = False
     derisk_until: float = 0.0
     scale_seen: int = 0  # engine sizing version the target was computed with
+    ratio: str = ""  # hedge qty per maker qty for two-asset pairs (fixed when the pair builds from flat)
 
     @property
     def target(self) -> Decimal:
@@ -157,6 +158,8 @@ class PairExecutor:
         self.maker: Venue = ctx.venues[pair.maker.venue]
         self.hedge: Venue = ctx.venues[pair.hedge.venue]
         self.ratio = D(pair.hedge_ratio)
+        # Two different assets: hedge $ per maker $. The quantity ratio follows from prices at each build from flat.
+        self.notional_ratio = D(pair.hedge_notional_ratio) if pair.hedge_notional_ratio is not None else None
         self.rotation = pair_rotation(pair, ctx.cfg.strategy)
         self.rt = Runtime()
         self.clip: Clip | None = None
@@ -174,6 +177,8 @@ class PairExecutor:
         if data:
             known = {k: v for k, v in data.items() if k in Runtime.__dataclass_fields__}
             self.rt = Runtime(**known)
+            if self.cross_asset and self.rt.ratio:
+                self.ratio = D(self.rt.ratio)
 
     def persist(self) -> None:
         self.ctx_save(asdict(self.rt))
@@ -186,6 +191,43 @@ class PairExecutor:
     @property
     def busy(self) -> bool:
         return self.clip is not None
+
+    @property
+    def cross_asset(self) -> bool:
+        """Maker and hedge are different assets (hedged by notional ratio, no basis guard)."""
+        return self.notional_ratio is not None
+
+    def _flat_usd(self, snap: Snapshot) -> Decimal:
+        return max(self.cfg.execution.imbalance_tolerance_usd,
+                   max(snap.maker_mkt.min_notional, snap.hedge_mkt.min_notional) * Decimal("1.1"))
+
+    def _set_ratio(self, snap: Snapshot) -> None:
+        """Two-asset pairs: fix the quantity ratio from current prices while both legs are flat.
+
+        With a position on, the ratio it was built with stays (persisted); after a restart without saved
+        state it is read back from the legs themselves.
+        """
+        if not self.cross_asset:
+            return
+        flat = self._flat_usd(snap)
+        maker_flat = abs(snap.maker_pos) * snap.maker_bbo.mid <= flat
+        hedge_flat = abs(snap.hedge_pos) * snap.hedge_bbo.mid <= flat
+        if maker_flat and hedge_flat:
+            ratio = strategy.qty_ratio(self.notional_ratio, snap.maker_bbo.mid, snap.hedge_bbo.mid)
+        elif self.rt.ratio:
+            return
+        elif snap.maker_pos != 0 and snap.hedge_pos != 0:
+            ratio = abs(snap.hedge_pos / snap.maker_pos)
+        else:
+            ratio = strategy.qty_ratio(self.notional_ratio, snap.maker_bbo.mid, snap.hedge_bbo.mid)
+        self.ratio = ratio
+        self.rt.ratio = str(ratio)
+
+    def _usd_ratio(self, snap: Snapshot) -> Decimal:
+        """Hedge notional per $1 of maker notional at current prices."""
+        if not self.cross_asset:
+            return self.ratio
+        return self.ratio * snap.hedge_bbo.mid / snap.maker_bbo.mid
 
     # ------------------------------------------------------------------- tick
     def step(self, now: float | None = None) -> None:
@@ -272,6 +314,9 @@ class PairExecutor:
     def _decide(self, now: float) -> None:
         snap = self._snapshot(self.cfg.poll.account_s)
         self._update_basis(snap, now)
+        if self.cross_asset and not self.rt.ratio:
+            self._set_ratio(snap)  # before the imbalance check, which measures the legs with this ratio
+            self.persist()
         if self._handle_imbalance(snap, now):
             return
         forced = self.ctx.take_forced_reduction(self.name)
@@ -303,6 +348,7 @@ class PairExecutor:
             self.persist()
 
     def _retarget(self, snap: Snapshot) -> None:
+        self._set_ratio(snap)
         scale, version = self.ctx.size_scale()
         self.rt.target_qty = str(strategy.target_quantity(
             self.rt.direction, self.pair.notional_usd * scale, snap.maker_bbo.mid, snap.maker_mkt.step_size))
@@ -342,7 +388,7 @@ class PairExecutor:
                 return self.rt.target
             if not self.rotation.enabled or now < self.rt.next_rotation_ts or self.ctx.halted:
                 return None
-            if not strategy.rotation_window_open(self.rotation.window, snap.maker_mkt.outside_rth):
+            if not strategy.rotation_window_open(self.rotation.window, snap.maker_mkt.outside_rth, int(now * 1000)):
                 return None
             if not self.ctx.rotation_budget_left():
                 self.rt.next_rotation_ts = now + 1800
@@ -369,7 +415,12 @@ class PairExecutor:
 
         # UNWIND
         unwind_to = D(self.rt.unwind_to)
-        if abs(pos - unwind_to) <= max(abs(target) * tol, snap.maker_mkt.step_size):
+        if self.cross_asset and unwind_to == 0:
+            # a full unwind goes all the way to flat so the rebuild starts with a fresh quantity ratio
+            done = abs(pos) * snap.maker_bbo.mid <= self._flat_usd(snap)
+        else:
+            done = abs(pos - unwind_to) <= max(abs(target) * tol, snap.maker_mkt.step_size)
+        if done:
             if self.rt.flip_pending:
                 self.rt.direction = -self.rt.direction
                 self.rt.flip_pending = False
@@ -400,11 +451,12 @@ class PairExecutor:
                 minutes_to_session_boundary(now_ms()) < s.session_blackout_min:
             return "session boundary"
         maker_px = snap.maker_bbo.price_for(side, aggressive=False)
-        hedge_px = snap.hedge_bbo.price_for(side.opposite(), aggressive=True)
-        edge = strategy.basis_edge_bps(side, maker_px, hedge_px, self.basis_ref if self.basis_ref is not None else
-                                       strategy.basis_bps(snap.maker_bbo.mid, snap.hedge_bbo.mid))
-        if edge < -s.basis_guard_bps:
-            return f"basis edge {edge:.1f}bps"
+        if not self.cross_asset:  # two different assets have no basis to guard
+            hedge_px = snap.hedge_bbo.price_for(side.opposite(), aggressive=True)
+            edge = strategy.basis_edge_bps(side, maker_px, hedge_px, self.basis_ref if self.basis_ref is not None else
+                                           strategy.basis_bps(snap.maker_bbo.mid, snap.hedge_bbo.mid))
+            if edge < -s.basis_guard_bps:
+                return f"basis edge {edge:.1f}bps"
         bounds = snap.maker_mkt.extra
         if snap.maker_mkt.outside_rth and bounds.get("upperTradingBound") and bounds.get("lowerTradingBound"):
             if not (D(bounds["lowerTradingBound"]) < maker_px < D(bounds["upperTradingBound"])):
@@ -415,6 +467,20 @@ class PairExecutor:
         leverage = min(D(self.pair.leverage), mkt.max_leverage_for_new_risk())
         return strategy.addable_notional(acct.equity, acct.gross_notional, acct.free_collateral, leverage,
                                          self.cfg.risk.max_account_leverage)
+
+    def _addable_maker_usd(self, snap: Snapshot) -> Decimal:
+        """Maker-leg notional both legs together can still add (hedge = maker x the notional ratio)."""
+        usd_ratio = self._usd_ratio(snap)
+        if self.pair.maker.venue != self.pair.hedge.venue:
+            return min(self._addable_usd(snap.maker_acct, snap.maker_mkt),
+                       self._addable_usd(snap.hedge_acct, snap.hedge_mkt) / usd_ratio)
+        # one account carries both legs: each maker $ needs its own margin plus usd_ratio $ of hedge margin
+        acct = snap.maker_acct
+        lev_m = min(D(self.pair.leverage), snap.maker_mkt.max_leverage_for_new_risk())
+        lev_h = min(D(self.pair.leverage), snap.hedge_mkt.max_leverage_for_new_risk())
+        by_margin = acct.free_collateral * Decimal("0.9") / (1 / lev_m + usd_ratio / lev_h)
+        by_account = (acct.equity * self.cfg.risk.max_account_leverage - acct.gross_notional) / (1 + usd_ratio)
+        return max(ZERO, min(by_margin, by_account))
 
     # ------------------------------------------------------------------ clips
     def _maybe_start_clip(self, snap: Snapshot, desired: Decimal, now: float) -> None:
@@ -434,8 +500,7 @@ class PairExecutor:
             return
         usd = strategy.clip_usd(abs(gap) * mid, s.clip_usd_min, s.clip_usd_max, self.rng)
         if increases:
-            usd = min(usd, self._addable_usd(snap.maker_acct, snap.maker_mkt),
-                      self._addable_usd(snap.hedge_acct, snap.hedge_mkt) / self.ratio)
+            usd = min(usd, self._addable_maker_usd(snap))
             if usd < min_usd:
                 self.ctx.event("warning", "margin", f"{self.name}: not enough free collateral to add",
                                pair=self.name, notify=True, throttle_key=f"margin:{self.name}", throttle_s=3600)
@@ -643,11 +708,12 @@ class PairExecutor:
         if self.ctx.halted and clip.purpose == "build":
             return "halted"
         hedge_bbo = self.hedge.bbo(self.pair.hedge.symbol)
-        hedge_px = hedge_bbo.price_for(clip.hedge_side, aggressive=True)
-        ref = self.basis_ref if self.basis_ref is not None else strategy.basis_bps(bbo.mid, hedge_bbo.mid)
-        edge = strategy.basis_edge_bps(clip.maker_side, order.price, hedge_px, ref)
-        if edge < -s.basis_guard_bps * 2:
-            return "basis moved"
+        if not self.cross_asset:
+            hedge_px = hedge_bbo.price_for(clip.hedge_side, aggressive=True)
+            ref = self.basis_ref if self.basis_ref is not None else strategy.basis_bps(bbo.mid, hedge_bbo.mid)
+            edge = strategy.basis_edge_bps(clip.maker_side, order.price, hedge_px, ref)
+            if edge < -s.basis_guard_bps * 2:
+                return "basis moved"
         if hedge_bbo.spread_bps > s.max_hedge_spread_bps * 2:
             return "hedge spread"
         return None
@@ -914,6 +980,7 @@ class PairExecutor:
             "next_rotation_in_min": round(max(0.0, self.rt.next_rotation_ts - time.time()) / 60, 1)
             if self.rt.phase == Phase.HOLD.value and self.rotation.enabled else None,
             "rotations": self.rt.rotations_done,
+            "hedge_qty_ratio": str(self.ratio),
             "busy": self.busy,
             "stats": asdict(self.stats),
             "disabled": self.disabled_reason,
