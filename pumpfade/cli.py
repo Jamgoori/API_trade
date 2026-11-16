@@ -20,8 +20,19 @@ def main(argv=None) -> None:
     sc = sub.add_parser("scan", help="show which coins qualify for a UTC day (no positions are opened)")
     sc.add_argument("--date", help="UTC date of the +20%% day, YYYY-MM-DD (default: the day that closed last)")
     sub.add_parser("paper", help="run the paper bot (scan at 09:01 KST, track positions every 30s)")
-    sub.add_parser("report", help="paper results per book")
-    sub.add_parser("status", help="open and pending paper positions")
+    lv = sub.add_parser("live", help="trade for real on Binance (needs BINANCE_API_KEY / BINANCE_API_SECRET)")
+    lv.add_argument("--i-understand-live", action="store_true", help="required: real orders with real money")
+    lv.add_argument("--resume", action="store_true", help="only clear a drawdown/flatten halt and exit; then start the bot again")
+    st = sub.add_parser("selftest", help="check the live order path (testnet by default)")
+    st.add_argument("--mainnet", action="store_true", help="run against the real exchange (no fill unless --fill)")
+    st.add_argument("--fill", action="store_true", help="on mainnet too: open and close a minimum-size short")
+    st.add_argument("--symbol", default="BTCUSDT")
+    fl = sub.add_parser("flatten", help="emergency: cancel the bot's orders and close its live positions")
+    fl.add_argument("--i-understand-live", action="store_true")
+    rp = sub.add_parser("report", help="results (paper books, or the live account with --live)")
+    rp.add_argument("--live", action="store_true")
+    ss = sub.add_parser("status", help="open positions (paper, or live with --live)")
+    ss.add_argument("--live", action="store_true")
     a = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
@@ -49,11 +60,56 @@ def main(argv=None) -> None:
         return
 
     from .runner import Runner
-    r = Runner(s)
+    from .trader import MAINNET, TESTNET, BinanceTrader
+
+    if a.cmd == "selftest":
+        import os
+        key = os.getenv("BINANCE_TESTNET_API_KEY") if not a.mainnet else s.api_key
+        secret = os.getenv("BINANCE_TESTNET_API_SECRET") if not a.mainnet else s.api_secret
+        from .selftest import run as selftest
+        ok = selftest(BinanceTrader(key, secret, MAINNET if a.mainnet else TESTNET), a.symbol,
+                      fill=a.fill or not a.mainnet)
+        raise SystemExit(0 if ok else 1)
+
+    live_cmd = a.cmd in ("live", "flatten") or getattr(a, "live", False)
+    if a.cmd in ("live", "flatten") and not a.i_understand_live:
+        raise SystemExit("refusing to touch the real account without --i-understand-live")
+    trader = BinanceTrader(s.api_key, s.api_secret, MAINNET) if live_cmd else None
+    if live_cmd and not a.db:
+        from pathlib import Path
+        s.db_path = Path(str(s.db_path).replace(".sqlite", "-live.sqlite"))
+    r = Runner(s, trader=trader)
     if a.cmd == "paper":
         r.run_forever()
+    elif a.cmd == "live":
+        trader.sync_time()
+        if trader.dual_side_position():
+            raise SystemExit("the account is in hedge mode: switch Binance futures to one-way mode first")
+        if a.resume:
+            r.store.put("live_halted", None)
+            r.store.put("live_peak", None)
+            print("halt cleared; the equity peak restarts from the current equity. Start the bot again.")
+            return
+        r.run_forever()
+    elif a.cmd == "flatten":
+        import time
+        trader.sync_time()
+        for n in r.engine.flatten():
+            print(n)
+        for _ in range(12):  # wait for the buys to settle and record the results (about a minute)
+            if not r.engine.book.all(("entering", "open", "closing")):
+                break
+            time.sleep(10)
+            r.engine.tick()
+        left = r.engine.book.all(("entering", "open", "closing"))
+        print("all flat; new entries stay stopped until `pumpfade live --resume`" if not left
+              else f"still open, check Binance: {', '.join(p.symbol for p in left)}")
     elif a.cmd == "report":
         print(r.report())
+    elif a.cmd == "status" and r.live:
+        for p in r.engine.book.all(("entering", "open", "closing")):
+            print(f"{p.symbol:<14} {p.sleeve:<8} {p.status:<8} qty {p.qty:g} entry {p.entry_avg or 0:.6g} "
+                  f"stop {p.sl_px or 0:.6g} TP {p.tp_px or 0:.6g} deadline {p.deadline_ms}")
     elif a.cmd == "status":
         for lg in r.store.active_legs():
             print(f"{lg.book:<8} {lg.symbol:<14} {lg.part} {lg.kind:<8} {lg.status:<7} "

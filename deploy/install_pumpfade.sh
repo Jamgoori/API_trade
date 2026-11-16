@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# pumpfade 페이퍼 봇 설치 (Ubuntu/Debian VPS). 저장소 폴더 안에서 실행:  bash deploy/install_pumpfade.sh
+# pumpfade 설치 (Ubuntu/Debian VPS). 저장소 폴더 안에서 실행:
+#   bash deploy/install_pumpfade.sh        → 페이퍼 봇 서비스 (pumpfade.service)
+#   bash deploy/install_pumpfade.sh live   → 실거래 봇 서비스 (pumpfade-live.service)
 # - 가벼운 전용 가상환경(.venv-pumpfade)에 requests, python-dotenv 만 설치
 # - systemd 서비스 pumpfade.service 등록 (부팅 시 자동 시작, 죽으면 30초 뒤 재시작). 시작은 직접 합니다.
 set -euo pipefail
@@ -7,6 +9,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO="$(pwd)"
 RUN_USER="${SUDO_USER:-$(id -un)}"
+NAME=pumpfade
+[ "${1:-}" = "live" ] && NAME=pumpfade-live
 PY="${PYTHON:-python3}"
 if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
   echo "Python 3.11 이상이 필요합니다: sudo apt install -y python3.12 python3.12-venv 후 PYTHON=python3.12 bash deploy/install_pumpfade.sh"
@@ -16,25 +20,40 @@ fi
 .venv-pumpfade/bin/pip install --upgrade pip >/dev/null
 .venv-pumpfade/bin/pip install "requests>=2.31" "python-dotenv>=1.0" >/dev/null
 mkdir -p data
-[ -f .env ] || { cp .env.example .env; chmod 600 .env; echo ".env 생성: 텔레그램 알림을 원하면 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 를 채우세요"; }
+[ -f .env ] || { cp .env.example .env; echo ".env 생성: 텔레그램 알림을 원하면 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 를 채우세요"; }
+chmod 600 .env
 if [ "$(id -u)" -eq 0 ] && [ "$RUN_USER" != "root" ]; then
   chown -R "$RUN_USER": .venv-pumpfade data .env
 fi
 
-UNIT=/etc/systemd/system/pumpfade.service
+UNIT=/etc/systemd/system/$NAME.service
 TMP="$(mktemp)"
-sed -e "s|@REPO@|$REPO|g" -e "s|@USER@|$RUN_USER|g" deploy/pumpfade.service > "$TMP"
+sed -e "s|@REPO@|$REPO|g" -e "s|@USER@|$RUN_USER|g" "deploy/$NAME.service" > "$TMP"
 SUDO=""
 [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 if [ -d /run/systemd/system ]; then
   $SUDO install -m 644 "$TMP" "$UNIT"
   $SUDO systemctl daemon-reload
-  $SUDO systemctl enable pumpfade >/dev/null
+  $SUDO systemctl enable "$NAME" >/dev/null
   echo "systemd 서비스 등록: $UNIT (아직 시작하지 않았습니다)"
 else
-  echo "systemd 가 없어 서비스 등록을 건너뜁니다. 직접 실행: .venv-pumpfade/bin/python -m pumpfade paper"
+  echo "systemd 가 없어 서비스 등록을 건너뜁니다. pumpfade/README.md 의 직접 실행 방법을 따르세요"
 fi
 rm -f "$TMP"
+
+if [ "$NAME" = "pumpfade-live" ]; then
+cat <<MSG
+
+실거래 서비스를 등록했어요 (아직 시작하지 않았습니다). pumpfade/README.md 의 '실거래' 순서대로:
+  1) .env 에 BINANCE_TESTNET_API_KEY / SECRET 을 넣고  .venv-pumpfade/bin/python -m pumpfade selftest
+  2) .env 에 BINANCE_API_KEY / SECRET 을 넣고          .venv-pumpfade/bin/python -m pumpfade selftest --mainnet
+  3) sudo systemctl start pumpfade-live
+  4) journalctl -u pumpfade-live -f
+  5) .venv-pumpfade/bin/python -m pumpfade status --live
+  긴급 정리: sudo systemctl stop pumpfade-live 후  .venv-pumpfade/bin/python -m pumpfade flatten --i-understand-live
+MSG
+exit 0
+fi
 
 cat <<MSG
 

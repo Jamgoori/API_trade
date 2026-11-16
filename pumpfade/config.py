@@ -55,6 +55,12 @@ class Settings:
     max_margin_used: float = 0.90      # never commit more than this share of equity as margin
     scan_delay_s: int = 60             # run the daily scan this long after 00:00 UTC (funding settles first)
     scan_deadline_s: int = 30 * 60     # a scan later than this after 00:00 UTC is skipped as stale
+    # live trading (pumpfade live): keys from BINANCE_API_KEY / BINANCE_API_SECRET, never from files in the repo
+    api_key: str | None = None
+    api_secret: str | None = None
+    live_margin_fraction: float = 0.05   # stage 1 of STRATEGY.md; raise to 0.12 once the stage-1 checks pass
+    live_reduce_drawdown: float = 0.25   # below this drawdown from the equity peak, size drops to two thirds
+    live_halt_drawdown: float = 0.35     # below this, new entries stop until `pumpfade live --resume`
     telegram_token: str | None = None
     telegram_chat: str | None = None
     strategy: Strategy = field(default_factory=Strategy)
@@ -79,6 +85,9 @@ class Settings:
         s.db_path = Path(os.getenv("PUMPFADE_DB", str(s.db_path)))
         s.start_equity = float(os.getenv("PUMPFADE_START_EQUITY", s.start_equity))
         s.margin_fraction = float(os.getenv("PUMPFADE_MARGIN_FRACTION", s.margin_fraction))
+        s.api_key = os.getenv("BINANCE_API_KEY") or None
+        s.api_secret = os.getenv("BINANCE_API_SECRET") or None
+        s.live_margin_fraction = float(os.getenv("PUMPFADE_LIVE_MARGIN_FRACTION", s.live_margin_fraction))
         s.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN") or None
         s.telegram_chat = os.getenv("TELEGRAM_CHAT_ID") or None
         return s

@@ -1,0 +1,19 @@
+# deploy/install_pumpfade.sh 가 @REPO@ / @USER@ 를 채워 /etc/systemd/system/pumpfade-live.service 로 설치합니다 (install_pumpfade.sh live).
+[Unit]
+Description=pumpfade LIVE bot (real orders on Binance futures)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@REPO@
+ExecStart=@REPO@/.venv-pumpfade/bin/python -m pumpfade live --i-understand-live
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

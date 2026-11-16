@@ -27,13 +27,20 @@ def kst(day: int) -> str:
 
 class Runner:
     def __init__(self, settings: Settings, client=None, store: Store | None = None, notifier=None, clock=None,
-                 listing_venues: dict | None = None):
+                 listing_venues: dict | None = None, trader=None):
         self.settings = settings
         self.client = client or BinancePublic(settings.base_url)
         self.store = store or Store(settings.db_path)
-        self.notifier = notifier or Notifier(settings.telegram_token, settings.telegram_chat, prefix="[pumpfade] ")
+        self.notifier = notifier or Notifier(settings.telegram_token, settings.telegram_chat,
+                                             prefix="[pumpfade LIVE] " if trader else "[pumpfade] ")
         self.clock = clock or (lambda: int(time.time() * 1000))
-        self.engine = PaperEngine(self.client, self.store, settings, notify=self.notifier.send, clock=self.clock)
+        self.live = trader is not None
+        if self.live:
+            from .live import LiveEngine
+            self.engine = LiveEngine(trader, self.client, self.store, settings, notify=self.notifier.send,
+                                     clock=self.clock)
+        else:
+            self.engine = PaperEngine(self.client, self.store, settings, notify=self.notifier.send, clock=self.clock)
         self.watcher = (ListingWatcher(self.store, self.client, settings, venues=listing_venues,
                                        notify=self.notifier.send, clock=self.clock)
                         if settings.watch_listings else None)
@@ -95,10 +102,15 @@ class Runner:
             self.store.put("report_day", today)
 
     def report(self) -> str:
+        if self.live:
+            return self.engine.report()
         return render(self.store, [b.name for b in self.settings.books], self.settings.start_equity)
 
     def run_forever(self, interval_s: float = 30.0) -> None:
-        self.notifier.send(f"paper bot started, books: {', '.join(b.name for b in self.settings.books)}")
+        if self.live:
+            self.notifier.send("LIVE bot started\n" + self.engine.report())
+        else:
+            self.notifier.send(f"paper bot started, books: {', '.join(b.name for b in self.settings.books)}")
         while True:
             try:
                 self.step()

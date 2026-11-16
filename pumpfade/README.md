@@ -1,7 +1,9 @@
-# pumpfade — 잡코인 펌핑 되돌림 숏 + 상장빔 숏 (페이퍼 모드)
+# pumpfade — 잡코인 펌핑 되돌림 숏 + 상장빔 숏
 
-`research/STRATEGY.md`의 두 규칙(메인: 일봉 +20% 펌핑 되돌림, 상장빔: 기존 코인의 신규 상장)을 **실시간 데이터로 돌리면서 가상으로 체결해 기록**하는 봇이에요.
-실제 주문은 넣지 않아요. 바이낸스 **공개 데이터만** 쓰기 때문에 계정이나 API 키가 필요 없어요.
+`research/STRATEGY.md`의 두 규칙(메인: 일봉 +20% 펌핑 되돌림, 상장빔: 기존 코인의 신규 상장)을 돌리는 봇이에요. 모드가 두 개 있어요.
+
+- **페이퍼 모드** (`paper`): 실시간 데이터로 가상 체결만 기록해요. 공개 데이터만 써서 API 키가 필요 없어요.
+- **실거래 모드** (`live`): 바이낸스 선물 계정에 진짜 주문을 넣어요. 아래 [실거래](#실거래-live) 부분을 끝까지 읽고 쓰세요.
 
 ## 하는 일
 
@@ -116,3 +118,133 @@ python -m pumpfade status
 | `PUMPFADE_WATCH_LISTINGS` | 1 | 0으로 두면 상장빔 감시를 끄고 메인 규칙만 기록 |
 
 전략 수치(익절·손절, 필터 기준 등)는 `pumpfade/config.py`의 `Strategy`에 있어요.
+
+## 실거래 (live)
+
+### 주문이 나가는 방식
+
+| 한국 시간 | 메인 규칙 |
+|---|---|
+| 09:01 | 신호 코인마다 격리(isolated) 1배로 맞추고, 09:00 시가 +0.5%에 **숏 지정가(GTC)** 를 걸어요. 수량은 계정 자산 × 신호당 비율 |
+| 09:01~10:00 | 일부라도 체결되면 바로 **손절 +15%(STOP_MARKET)** 와 **익절 −15%(TAKE_PROFIT_MARKET)** 를 거래소에 걸어요. 둘 다 `closePosition`이라 포지션 전체를 닫아요 |
+| 10:00 | 남은 지정가를 취소하고 나머지를 IOC로 팔아요. 최우선 매수호가에서 −0.3%보다 싼 가격엔 안 팔아요 |
+| 진입 48시간 후 | 남아 있으면 시장가(reduceOnly)로 사서 정리해요 |
+
+상장빔은 예정 시각에 IOC(최대 −0.3%)로 바로 숏을 잡고, 손절·익절·48시간은 똑같아요.
+
+손절·익절 주문은 **거래소에 걸려 있어서 봇이 꺼져도 작동해요.** 봇은 30초마다 거래소에 실제 포지션·주문·체결을 물어보고 장부를 맞춰요. 껐다 켜도 이어서 관리해요.
+
+안전장치:
+- 손절 주문이 거부되면 그 포지션을 **바로 시장가로 정리**하고 텔레그램으로 알려요.
+- 거래소 응답이 잠깐 늦어도 청산으로 착각하지 않게, 포지션이 0으로 **두 번(25초 이상 간격)** 보여야 끝난 걸로 쳐요.
+- 봇이 10시에 꺼져 있었으면 10:30이 지난 뒤엔 IOC 진입을 하지 않아요(늦은 가격으로 들어가지 않기).
+- 봇이 안 연 포지션(직접 잡은 포지션)은 건드리지 않고 알림만 보내요.
+- 자산 고점 대비 **−25%** 면 신호당 비율을 2/3로 줄이고 새 고점에서 되돌려요. **−35%** 이거나 최근 100건 평균이 **−1.5% 미만**이면 새 진입을 멈춰요.
+- 메인 규칙에서 손절한 코인은 다시 진입하지 않아요.
+
+### 계정 준비
+
+1. 봇 전용 **서브계정**을 쓰는 걸 추천해요. 봇은 포지션을 정리할 때 그 코인의 미체결 주문을 전부 취소해요.
+2. 선물 설정: **단방향(One-way) 포지션 모드**, **단일 자산(Single-Asset) 모드**여야 해요. 격리 마진은 멀티에셋 모드에서 안 돼요.
+3. API 키: **선물 거래 권한만** 켜고, **출금은 끄고**, **IP 제한**(VPS 고정 IP)을 거세요.
+4. 키는 **VPS의 `.env` 파일에만** 넣으세요. 채팅이나 깃허브에 붙여넣지 마세요. `.env`는 git에 안 올라가요.
+5. VPS는 미국 서버를 피하세요. 바이낸스가 미국 IP를 막아요. 도쿄·싱가포르·서울 리전이 무난해요.
+
+### 순서
+
+**1단계 — 테스트넷 점검 (진짜 돈 아님)**
+
+testnet.binancefuture.com 에서 테스트넷 키를 만들어 `.env`의 `BINANCE_TESTNET_API_KEY`, `BINANCE_TESTNET_API_SECRET`에 넣고:
+
+```bash
+python -m pumpfade selftest
+```
+
+시간 동기화 → 단방향 모드 확인 → 격리 1배 설정 → 지정가 주문·조회·취소 → 손절(algo) 주문·조회·취소 → 최소 수량 숏 진입 → 손절·익절 걸기 → 시장가 청산 → 체결 내역 조회까지 해보고 `ALL OK`가 나와야 해요.
+
+**2단계 — 실계정 점검 (주문은 바로 취소)**
+
+`.env`에 `BINANCE_API_KEY`, `BINANCE_API_SECRET`을 넣고:
+
+```bash
+python -m pumpfade selftest --mainnet
+```
+
+체결되지 않을 먼 가격에 주문을 넣었다 바로 취소해요. 돈은 안 움직여요. `--fill`을 붙이면 BTC 최소 수량(약 100달러)으로 숏을 잡았다 바로 닫아봐요(수수료 몇 센트).
+
+**3단계 — 실거래 5%로 시작**
+
+`.env`의 `PUMPFADE_LIVE_MARGIN_FRACTION`은 처음 `0.05`예요.
+
+```bash
+bash deploy/install_pumpfade.sh live
+```
+
+```bash
+sudo systemctl start pumpfade-live
+```
+
+```bash
+journalctl -u pumpfade-live -f
+```
+
+PC에서 직접 돌릴 땐 `python -m pumpfade live --i-understand-live` 예요. 매일 09:00 전에 켜져 있어야 해요.
+
+**4단계 — 12%로 올리기**
+
+2~4주 동안 주문·체결·손절·익절·48시간 정리가 기대대로 됐고, 10시 IOC 슬리피지가 0.3% 이하였으면 `.env`에서 `PUMPFADE_LIVE_MARGIN_FRACTION=0.12`로 바꾸고 재시작해요.
+
+```bash
+sudo systemctl restart pumpfade-live
+```
+
+### 확인과 비상 정리
+
+```bash
+python -m pumpfade status --live
+```
+
+```bash
+python -m pumpfade report --live
+```
+
+- `status --live`: 지금 들고 있는 포지션, 진입가, 손절·익절 가격
+- `report --live`: 계좌 자산, 고점 대비 낙폭, 지금 신호당 비율, 규칙별 성적, 지정가 체결 비율
+
+비상시엔 봇을 멈추고 전부 정리해요.
+
+```bash
+sudo systemctl stop pumpfade-live
+```
+
+```bash
+python -m pumpfade flatten --i-understand-live
+```
+
+`flatten`은 봇이 연 포지션만 주문 취소 후 시장가로 정리하고, **새 진입을 멈춘 상태로** 둬요. 진입이 멈춘 상태(낙폭 −35%나 `flatten` 뒤)에서 다시 시작하려면 멈춤을 풀고 봇을 켜요.
+
+```bash
+python -m pumpfade live --i-understand-live --resume
+```
+
+```bash
+sudo systemctl start pumpfade-live
+```
+
+`--resume`은 멈춤만 풀고 끝나요. 자산 고점도 지금 자산으로 다시 잡아요.
+
+### 백테스트와 다른 점
+
+- 익절을 백테스트는 지정가(메이커 0.02%)로 쳤는데, 실거래는 TAKE_PROFIT_MARKET이라 테이커(0.05%)예요. 건당 약 0.03%p 차이라 결과에 거의 영향 없어요.
+- 손절은 +15%에 닿는 순간 시장가로 나가서, 급등 중엔 +15%보다 더 비싸게 사질 수 있어요(백테스트는 0.3~0.5% 슬리피지 가정).
+- 실거래 기록은 `data/pumpfade-live.sqlite`에 따로 쌓여요. 페이퍼 봇과 동시에 돌려도 서로 안 섞여요.
+
+### 실거래 설정
+
+| 변수 | 기본값 | 내용 |
+|---|---|---|
+| `BINANCE_API_KEY` / `BINANCE_API_SECRET` | 없음 | 실계정 API 키 (`.env`에만) |
+| `BINANCE_TESTNET_API_KEY` / `BINANCE_TESTNET_API_SECRET` | 없음 | 테스트넷 키 (`selftest`용) |
+| `PUMPFADE_LIVE_MARGIN_FRACTION` | 0.05 | 신호당 증거금 비율. 점검 후 0.12 |
+
+낙폭 기준(−25% / −35%)과 최대 증거금 사용(90%)은 `pumpfade/config.py`의 `Settings`에 있어요.
