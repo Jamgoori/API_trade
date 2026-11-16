@@ -101,7 +101,7 @@ class Runner:
             self.engine.settle_all_funding()
             self.store.put("funding_ms", now)
         if (self.store.get("report_day") or 0) < today and since >= 35 * 60_000:
-            self.notifier.send("daily paper report\n" + self.report())
+            self.notifier.send(("daily live report\n" if self.live else "daily paper report\n") + self.report())
             self.store.put("report_day", today)
 
     def report(self) -> str:
