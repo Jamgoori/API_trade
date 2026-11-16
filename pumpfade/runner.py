@@ -41,6 +41,11 @@ class Runner:
                                      clock=self.clock)
         else:
             self.engine = PaperEngine(self.client, self.store, settings, notify=self.notifier.send, clock=self.clock)
+        self.commands = None
+        if settings.telegram_token and settings.telegram_chat:
+            from .tgcmd import TelegramCommands
+            self.commands = TelegramCommands(settings.telegram_token, settings.telegram_chat, self.store,
+                                             {"status": self.status_text, "report": self.report})
         self.watcher = (ListingWatcher(self.store, self.client, settings, venues=listing_venues,
                                        notify=self.notifier.send, clock=self.clock)
                         if settings.watch_listings else None)
@@ -97,12 +102,40 @@ class Runner:
                 log.exception("listing watcher failed")
                 self.notifier.send(f"listing watcher failed: {exc}", level="warning", key="listings", throttle_s=3600)
         self.engine.tick()
+        if self.commands is not None:
+            try:
+                self.commands.poll()
+            except Exception:
+                log.exception("telegram commands failed")
         if now - (self.store.get("funding_ms") or 0) >= HOUR_MS:
             self.engine.settle_all_funding()
             self.store.put("funding_ms", now)
         if (self.store.get("report_day") or 0) < today and since >= 35 * 60_000:
             self.notifier.send(("daily live report\n" if self.live else "daily paper report\n") + self.report())
             self.store.put("report_day", today)
+
+    def status_text(self) -> str:
+        """Equity and open positions, for /status."""
+        now = self.clock()
+        last = self.store.get("last_scan_day")
+        lines = [f"last 09:00 scan: {kst(last) if last is not None else 'none yet'}"]
+        if self.live:
+            from .live import ACTIVE
+            rs = self.engine.risk_state()
+            lines.insert(0, f"equity ${rs['equity']:,.2f} ({rs['dd']:+.1%} from peak), size {rs['fraction']:.1%}"
+                         + (f", NEW ENTRIES STOPPED: {rs['halted']}" if rs["halted"] else ""))
+            active = self.engine.book.all(ACTIVE)
+            for p in active:
+                left = f", closes in {(p.deadline_ms - now) / HOUR_MS:.0f}h" if p.deadline_ms else ""
+                lines.append(f"{p.symbol} ({p.sleeve}, {p.status}) qty {p.qty:g} entry {p.entry_avg or 0:.6g} "
+                             f"stop {p.sl_px or 0:.6g} TP {p.tp_px or 0:.6g}{left}")
+        else:
+            active = self.store.active_legs()
+            for lg in active:
+                lines.append(f"{lg.book} {lg.symbol} {lg.kind} {lg.status}")
+        if not active:
+            lines.append("no open positions")
+        return "\n".join(lines)
 
     def report(self) -> str:
         if self.live:
@@ -119,5 +152,5 @@ class Runner:
                 self.step()
             except Exception as exc:
                 log.exception("step failed")
-                self.notifier.send(f"paper step failed: {exc}", level="error", key="step", throttle_s=3600)
+                self.notifier.send(f"step failed: {exc}", level="error", key="step", throttle_s=3600)
             time.sleep(interval_s)

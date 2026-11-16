@@ -548,3 +548,51 @@ def test_telegram_setup_finds_the_chat_then_sends_a_test(monkeypatch):
     lines.clear()
     assert not telegram_check(token, None, lines.append) and "press Start" in lines[0]
     assert not any(token in x for x in lines)
+
+
+def test_telegram_commands_answer_only_the_owner_and_never_twice(monkeypatch, tmp_path):
+    import requests
+
+    from pumpfade.tgcmd import HELP, TelegramCommands, parse
+
+    assert parse("/status@my_bot") == "status" and parse("상태") == "status" and parse("성과 보여줘") == "report"
+    store = Store(tmp_path / "t.sqlite")
+    updates = [
+        {"update_id": 10, "message": {"chat": {"id": 4242}, "text": "/status"}},
+        {"update_id": 11, "message": {"chat": {"id": 999}, "text": "/status"}},   # a stranger
+        {"update_id": 12, "message": {"chat": {"id": 4242}, "text": "hello"}},
+    ]
+    seen_offsets, sent = [], []
+
+    class R:
+        def __init__(self, body):
+            self.body = body
+
+        def json(self):
+            return self.body
+
+    def get(url, params=None, **k):
+        seen_offsets.append(params.get("offset"))
+        off = params.get("offset") or 0
+        return R({"ok": True, "result": [u for u in updates if u["update_id"] >= off]})
+
+    monkeypatch.setattr(requests, "get", get)
+    monkeypatch.setattr(requests, "post", lambda url, json=None, **k: sent.append(json) or R({"ok": True}))
+    tc = TelegramCommands("123:" + "x" * 30, "4242", store, {"status": lambda: "equity $3,000", "report": lambda: "r"})
+    assert tc.poll() == 2
+    assert [m["text"] for m in sent] == ["equity $3,000", HELP] and all(m["chat_id"] == "4242" for m in sent)
+    assert tc.poll() == 0 and seen_offsets[-1] == 13   # already answered: never repeated, even after a restart
+
+
+def test_runner_status_text_lists_live_positions(env, tmp_path):
+    from pumpfade.runner import Runner
+
+    ex, store, eng, msgs = env
+    eng.open_signals([cand()], DAY)
+    ex.set_price(1.01)
+    eng.tick()
+    r = Runner(eng.settings, client=FakePublic(), store=store, notifier=type("N", (), {"send": lambda *a, **k: None})(),
+               clock=lambda: ex.now, trader=ex)
+    r.engine = eng
+    text = r.status_text()
+    assert "equity $" in text and "TGTUSDT (main, open)" in text and "closes in 48h" in text
