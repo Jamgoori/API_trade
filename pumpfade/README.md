@@ -170,7 +170,13 @@ python -m pumpfade selftest
 python -m pumpfade selftest --mainnet
 ```
 
-체결되지 않을 먼 가격에 주문을 넣었다 바로 취소해요. 돈은 안 움직여요. `--fill`을 붙이면 BTC 최소 수량(약 100달러)으로 숏을 잡았다 바로 닫아봐요(수수료 몇 센트).
+체결되지 않을 먼 가격에 주문을 넣었다 바로 취소해요. 돈은 안 움직여요.
+
+실제 체결까지 해보려면 최소 주문이 5달러인 코인으로 해요. 약 6달러어치 숏을 잡고, 손절·익절을 걸었다가, 바로 닫아봐요(수수료 1센트 미만). 테스트넷 키를 못 만들었으면 이걸로 1단계를 대신해도 돼요.
+
+```bash
+python -m pumpfade selftest --mainnet --fill --symbol DOGEUSDT
+```
 
 **3단계 — 실거래 5%로 시작**
 
