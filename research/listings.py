@@ -21,8 +21,30 @@ from binance_data import _get, list_bucket
 from short_study import H_DAY, load
 
 HERE = Path(__file__).resolve().parent
+ROOT_CACHE = HERE.parent / "data" / "listings"
 START = pd.Timestamp("2023-12-01", tz="UTC")
 S = requests.Session()
+
+
+def _to_param(base_url: str, t_utc: pd.Timestamp) -> str:
+    # Upbit takes an ISO UTC time; Bithumb takes "YYYY-MM-DD HH:MM:SS" in KST
+    if "bithumb" in base_url:
+        return (t_utc + pd.Timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S")
+    return t_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _candles(base_url: str, path: str, params: dict) -> list:
+    for attempt in range(5):
+        try:
+            r = S.get(f"{base_url}{path}", params=params, timeout=20)
+        except requests.RequestException:
+            time.sleep(1 + attempt)
+            continue
+        if r.status_code == 200:
+            body = r.json()
+            return body if isinstance(body, list) else []
+        time.sleep(1 + attempt)
+    return []
 
 
 def krw_first_candle(base_url: str, market: str) -> pd.Timestamp | None:
@@ -33,12 +55,7 @@ def krw_first_candle(base_url: str, market: str) -> pd.Timestamp | None:
         params = {"market": market, "count": 200}
         if to:
             params["to"] = to
-        for attempt in range(5):
-            r = S.get(f"{base_url}/v1/candles/days", params=params, timeout=20)
-            if r.status_code == 200:
-                break
-            time.sleep(1 + attempt)
-        rows = r.json() if r.status_code == 200 else []
+        rows = _candles(base_url, "/v1/candles/days", params)
         if not rows:
             break
         oldest = pd.Timestamp(rows[-1]["candle_date_time_utc"], tz="UTC")
@@ -46,16 +63,15 @@ def krw_first_candle(base_url: str, market: str) -> pd.Timestamp | None:
             break
         if oldest < START:
             return None
-        to = oldest.strftime("%Y-%m-%dT%H:%M:%SZ")
+        to = _to_param(base_url, oldest)
         time.sleep(0.12)
     return oldest
 
 
 def krw_listing_hour(base_url: str, market: str, day: pd.Timestamp) -> pd.Timestamp:
     """First hourly candle on the listing day."""
-    to = (day + pd.Timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    r = S.get(f"{base_url}/v1/candles/minutes/60", params={"market": market, "count": 24, "to": to}, timeout=20)
-    rows = r.json() if r.status_code == 200 else []
+    rows = _candles(base_url, "/v1/candles/minutes/60",
+                    {"market": market, "count": 24, "to": _to_param(base_url, day + pd.Timedelta(days=1))})
     if not rows:
         return day
     return min(pd.Timestamp(x["candle_date_time_utc"], tz="UTC") for x in rows)
@@ -104,13 +120,22 @@ def binance_spot_listings() -> list[dict]:
 def main() -> None:
     syms = load()
     perp_start = {name: pd.Timestamp(s.t0 * 3600, unit="s", tz="UTC") for name, s in syms.items()}
-    rows = binance_spot_listings()
-    print(f"binance spot listings since {START.date()}: {len(rows)}", flush=True)
-    for venue, url in (("upbit", "https://api.upbit.com"), ("bithumb", "https://api.bithumb.com")):
-        got = krw_listings(venue, url)
-        print(f"{venue} KRW listings since {START.date()}: {len(got)}", flush=True)
-        rows += got
-    df = pd.DataFrame(rows)
+    cache = ROOT_CACHE
+    cache.mkdir(parents=True, exist_ok=True)
+    frames = []
+    for venue, fetch in (("binance_spot", binance_spot_listings),
+                         ("upbit", lambda: krw_listings("upbit", "https://api.upbit.com")),
+                         ("bithumb", lambda: krw_listings("bithumb", "https://api.bithumb.com"))):
+        path = cache / f"listings_{venue}.csv"
+        if path.exists():
+            f = pd.read_csv(path, parse_dates=["listed"])
+        else:
+            f = pd.DataFrame(fetch())
+            f.to_csv(path, index=False)
+        print(f"{venue} listings since {START.date()}: {len(f)}", flush=True)
+        frames.append(f)
+    df = pd.concat(frames, ignore_index=True)
+    df["listed"] = pd.to_datetime(df["listed"], utc=True)
     out = []
     for r in df.itertuples():
         for perp in (f"{r.base}USDT", f"1000{r.base}USDT", f"1000000{r.base}USDT"):
