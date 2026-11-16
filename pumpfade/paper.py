@@ -1,9 +1,10 @@
 """Paper execution: turn scan results into simulated shorts and follow them to take-profit, stop or time exit.
 
 Every book in Settings.books gets the same signals:
-- market: the whole position sells at 00:00 UTC into the live order book (IOC, at most 0.3% below the best bid);
-- limit:  a sell limit 0.5% above the 00:00 open, kept for an hour; if the price never trades through it,
-          the order is cancelled and the position sells at market at 01:00 UTC;
+- limit:  (the strategy) a sell limit 0.5% above the 00:00 UTC open, kept for an hour; if the price never trades
+          through it, the order is cancelled and the position sells at market at 01:00 UTC (IOC, at most 0.3%
+          below the best bid);
+- market: the whole position sells at 00:00 UTC into the live order book (same IOC cap);
 - half:   half of each.
 Take-profit is a resting buy limit (fills when a 1-minute low trades below it), the stop is a stop-market
 (fills at the stop or the candle open if it gapped past, plus the slippage of the live book), and whatever is

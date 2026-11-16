@@ -50,10 +50,10 @@ class Settings:
     telegram_chat: str | None = None
     strategy: Strategy = field(default_factory=Strategy)
     books: tuple[BookSpec, ...] = (
-        BookSpec("half", "half"),            # the strategy as written (STRATEGY.md)
-        BookSpec("market", "market"),
-        BookSpec("limit", "limit"),
-        BookSpec("half_3d", "half", hold_hours=72),
+        BookSpec("limit", "limit"),          # the strategy as written (STRATEGY.md)
+        BookSpec("market", "market"),        # comparisons
+        BookSpec("half", "half"),
+        BookSpec("limit_3d", "limit", hold_hours=72),
     )
 
     @classmethod

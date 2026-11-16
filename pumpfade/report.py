@@ -6,8 +6,8 @@ from collections import defaultdict
 
 from .store import Store
 
-# Backtest 2024-01..2026-10, rule as written (research/STRATEGY.md, README 20 and 22)
-EXPECTED = {"per_signal": 0.021, "win": 0.63, "tp": 0.37, "stop": 0.31, "time": 0.32, "limit_fill": 0.83}
+# Backtest 2024-01..2026-10 of the rule as written: limit entry, wick and funding filters (research/STRATEGY.md)
+EXPECTED = {"per_signal": 0.020, "win": 0.63, "tp": 0.34, "stop": 0.31, "time": 0.35, "limit_fill": 0.86}
 
 
 def book_stats(store: Store, book: str, start_equity: float) -> dict:
