@@ -27,6 +27,8 @@ def main(argv=None) -> None:
     st.add_argument("--mainnet", action="store_true", help="run against the real exchange (no fill unless --fill)")
     st.add_argument("--fill", action="store_true", help="on mainnet too: open and close a minimum-size short")
     st.add_argument("--symbol", default="BTCUSDT")
+    st.add_argument("--close-leftover", action="store_true",
+                    help="with --fill: first close a position on --symbol left by an earlier selftest")
     fl = sub.add_parser("flatten", help="emergency: cancel the bot's orders and close its live positions")
     fl.add_argument("--i-understand-live", action="store_true")
     rp = sub.add_parser("report", help="results (paper books, or the live account with --live)")
@@ -69,7 +71,7 @@ def main(argv=None) -> None:
         secret = os.getenv("BINANCE_TESTNET_API_SECRET") if not a.mainnet else s.api_secret
         from .selftest import run as selftest
         ok = selftest(BinanceTrader(key, secret, MAINNET if a.mainnet else TESTNET), a.symbol,
-                      fill=a.fill or not a.mainnet)
+                      fill=a.fill or not a.mainnet, close_leftover=a.close_leftover)
         raise SystemExit(0 if ok else 1)
 
     live_cmd = a.cmd in ("live", "flatten") or getattr(a, "live", False)

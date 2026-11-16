@@ -36,6 +36,34 @@ NO_NEED_MARGIN_TYPE = -4046
 UNKNOWN_ORDER = (-2011, -2013)
 
 
+def avg_fill_price(tr, symbol: str, order: dict | None, cid: str | None = None) -> float | None:
+    """Average fill price of an order. Binance's order response does not always carry avgPrice, so fall back to
+    cumQuote / executedQty, then to querying the order, then to the order's own trades."""
+    o = dict(order or {})
+    try:
+        avg = float(o.get("avgPrice") or 0)
+        if avg > 0:
+            return avg
+        qty, quote = float(o.get("executedQty") or 0), float(o.get("cumQuote") or 0)
+        if qty > 0 and quote > 0:
+            return quote / qty
+        cid = cid or o.get("clientOrderId")
+        if cid:
+            q = tr.query_order(symbol, cid) or {}
+            avg = float(q.get("avgPrice") or 0)
+            if avg > 0:
+                return avg
+            o.update(q)
+        if o.get("orderId") is not None:
+            fills = tr.order_trades(symbol, o["orderId"])
+            qty = sum(float(t["qty"]) for t in fills)
+            if qty > 0:
+                return sum(float(t["qty"]) * float(t["price"]) for t in fills) / qty
+    except Exception:
+        log.warning("could not read the fill price of %s on %s", cid, symbol, exc_info=True)
+    return None
+
+
 class Filters:
     def __init__(self, tick: Decimal, step: Decimal, min_qty: Decimal, min_notional: Decimal):
         self.tick, self.step, self.min_qty, self.min_notional = tick, step, min_qty, min_notional
@@ -210,12 +238,24 @@ class BinanceTrader:
                 return None
             raise
 
-    def cancel_algo(self, cid: str) -> None:
+    def cancel_algo(self, cid: str | None = None, algo_id: int | None = None) -> None:
         try:
-            self.signed("DELETE", "/fapi/v1/algoOrder", {"clientAlgoId": cid})
+            self.signed("DELETE", "/fapi/v1/algoOrder", {"clientAlgoId": cid} if algo_id is None else {"algoId": algo_id})
         except VenueError as exc:
             if self.code_of(exc) not in UNKNOWN_ORDER:
                 raise
+            log.info("algo order %s was already gone", cid or algo_id)
+
+    def open_algos(self, symbol: str) -> list[dict]:
+        """Conditional orders still waiting on this symbol."""
+        try:
+            body = self.signed("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
+        except VenueError as exc:
+            if exc.status not in (400, 404):
+                raise
+            body = self.signed("GET", "/fapi/v1/allAlgoOrders", {"symbol": symbol}, weight=5)
+        rows = body if isinstance(body, list) else (body.get("orders") or body.get("rows") or [])
+        return [r for r in rows if str(r.get("algoStatus", "NEW")).upper() == "NEW" and r.get("symbol", symbol) == symbol]
 
     def cancel_all_algos(self, symbol: str) -> None:
         self.signed("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol})
@@ -225,6 +265,9 @@ class BinanceTrader:
     def user_trades(self, symbol: str, start_ms: int) -> list[dict]:
         return self.signed("GET", "/fapi/v1/userTrades", {"symbol": symbol, "startTime": start_ms, "limit": 1000},
                            weight=5)
+
+    def order_trades(self, symbol: str, order_id: int) -> list[dict]:
+        return self.signed("GET", "/fapi/v1/userTrades", {"symbol": symbol, "orderId": order_id}, weight=5)
 
     def funding_income(self, symbol: str, start_ms: int) -> float:
         rows = self.signed("GET", "/fapi/v1/income", {"symbol": symbol, "incomeType": "FUNDING_FEE",

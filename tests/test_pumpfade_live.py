@@ -31,9 +31,24 @@ class FakeExchange:
         self.fail_stop = False
         self.extra_positions: dict[str, float] = {}
         self.prepared = []
+        self.query_has_avg = True
+        # what the selftest needs besides the bot's calls
+        self.base_url, self.offset_ms, self.spot_http = "fake", 0, None
 
     # --- helpers for tests
-    def _fill(self, side, qty, price, maker=False):
+    def sync_time(self):
+        pass
+
+    def dual_side_position(self):
+        return False
+
+    def positions(self):
+        return {SYM: self.pos} if self.pos else {}
+
+    def order_trades(self, symbol, order_id):
+        return [t for t in self.trades if t.get("orderId") == order_id]
+
+    def _fill(self, side, qty, price, maker=False, oid=None):
         fee = qty * price * (0.0002 if maker else 0.0005)
         realized = 0.0
         if side == "SELL":
@@ -46,14 +61,14 @@ class FakeExchange:
                 self.pos = 0.0
         self.cash += realized - fee
         self.trades.append({"side": side, "qty": str(qty), "price": str(price), "realizedPnl": str(realized),
-                            "commission": str(fee), "commissionAsset": "USDT", "time": self.now})
+                            "commission": str(fee), "commissionAsset": "USDT", "time": self.now, "orderId": oid})
 
     def set_price(self, px):
         self.px = px
         for o in self.orders.values():
             if o["status"] in ("NEW", "PARTIALLY_FILLED") and o["side"] == "SELL" and o["tif"] == "GTC" and px >= o["price"]:
                 q = o["qty"] - o["executed"]
-                self._fill("SELL", q, o["price"], maker=True)
+                self._fill("SELL", q, o["price"], maker=True, oid=o["orderId"])
                 o["avg"] = o["price"]
                 o["executed"] = o["qty"]
                 o["status"] = "FILLED"
@@ -67,7 +82,7 @@ class FakeExchange:
 
     def partial_fill(self, cid, qty):
         o = self.orders[cid]
-        self._fill("SELL", qty, o["price"], maker=True)
+        self._fill("SELL", qty, o["price"], maker=True, oid=o["orderId"])
         o["executed"] += qty
         o["avg"] = o["price"]
         o["status"] = "PARTIALLY_FILLED"
@@ -92,29 +107,33 @@ class FakeExchange:
         cid = p["newClientOrderId"]
         qty, typ = float(p["quantity"]), p["type"]
         o = {"side": p["side"], "qty": qty, "price": float(p.get("price") or 0), "tif": p.get("timeInForce"),
-             "executed": 0.0, "avg": 0.0, "status": "NEW"}
+             "executed": 0.0, "avg": 0.0, "status": "NEW", "orderId": len(self.orders) + 1, "cid": cid}
         self.orders[cid] = o
         bid, ask = self.book_top(SYM)
         if typ == "LIMIT" and p["timeInForce"] == "IOC":
             if bid >= o["price"]:
-                self._fill("SELL", qty, bid)
+                self._fill("SELL", qty, bid, oid=o["orderId"])
                 o.update(executed=qty, avg=bid, status="FILLED")
             else:
                 o["status"] = "EXPIRED"
         elif typ == "MARKET":
             q = min(qty, -self.pos) if p.get("reduceOnly") == "true" else qty
-            self._fill(p["side"], q, ask)
+            self._fill(p["side"], q, ask, oid=o["orderId"])
             o.update(executed=q, avg=ask, status="FILLED")
         elif p["side"] == "SELL" and self.px >= o["price"]:
             self.set_price(self.px)
-        return self._view(o)
+        return self._view(o, avg=False)  # like Binance today: the order response carries no avgPrice
 
-    def _view(self, o):
-        return {"status": o["status"], "executedQty": str(o["executed"]), "avgPrice": str(o["avg"])}
+    def _view(self, o, avg=True):
+        v = {"status": o["status"], "executedQty": str(o["executed"]), "orderId": o["orderId"],
+             "clientOrderId": o["cid"]}
+        if avg:
+            v["avgPrice"] = str(o["avg"])
+        return v
 
     def query_order(self, symbol, cid):
         o = self.orders.get(cid)
-        return self._view(o) if o else None
+        return self._view(o, avg=self.query_has_avg) if o else None
 
     def cancel_order(self, symbol, cid):
         o = self.orders.get(cid)
@@ -130,16 +149,22 @@ class FakeExchange:
     def new_algo(self, **p):
         if p["type"] == "STOP_MARKET" and self.fail_stop:
             raise RuntimeError("rejected")
-        self.algos[p["clientAlgoId"]] = {"type": p["type"], "trigger": float(p["triggerPrice"]), "status": "NEW"}
-        return {"algoStatus": "NEW"}
+        self.algos[p["clientAlgoId"]] = {"type": p["type"], "trigger": float(p["triggerPrice"]), "status": "NEW",
+                                         "algoId": len(self.algos) + 1}
+        return {"algoStatus": "NEW", "algoId": len(self.algos)}
 
     def query_algo(self, cid):
         a = self.algos.get(cid)
         return {"algoStatus": a["status"]} if a else None
 
-    def cancel_algo(self, cid):
-        if cid in self.algos and self.algos[cid]["status"] == "NEW":
-            self.algos[cid]["status"] = "CANCELED"
+    def cancel_algo(self, cid=None, algo_id=None):
+        for k, a in self.algos.items():
+            if (k == cid or a["algoId"] == algo_id) and a["status"] == "NEW":
+                a["status"] = "CANCELED"
+
+    def open_algos(self, symbol):
+        return [{"algoId": a["algoId"], "clientAlgoId": k, "algoStatus": "NEW", "symbol": SYM}
+                for k, a in self.algos.items() if a["status"] == "NEW"]
 
     def cancel_all_algos(self, symbol):
         for a in self.algos.values():
@@ -413,3 +438,75 @@ def test_selftest_diagnosis_names_missing_futures_permission_and_empty_wallet():
     assert not ok and any("withdrawals are ON" in x for x in lines) and any("not IP-restricted" in x for x in lines)
     lines.clear()
     assert diagnose(DiagTrader({"enableReading": True, "enableFutures": True, "ipRestrict": True}), 3_000.0, lines.append)
+
+
+def test_ioc_fill_price_comes_from_the_trades_when_no_response_carries_it(env):
+    ex, store, eng, msgs = env
+    ex.query_has_avg = False
+    eng.open_signals([cand()], DAY)
+    ex.set_price(0.98)
+    ex.now = ENTRY + HOUR_MS + 30_000
+    eng.tick()
+    p = eng.book.all()[0]
+    assert p.status == "open" and p.entry_avg == pytest.approx(0.98 * 0.999)
+    assert p.sl_px == pytest.approx(0.98 * 0.999 * 1.15, abs=1e-4)
+
+
+def test_selftest_fill_round_trip_and_leftover_handling():
+    from pumpfade.selftest import run
+
+    ex = FakeExchange()
+    ex.query_has_avg = False
+    lines = []
+    assert run(ex, SYM, fill=True, out=lines.append), "\n".join(lines)
+    assert ex.pos == 0 and any("fill price read back: 0.999" in x for x in lines)
+    ex._fill("SELL", 102, 1.0)       # a short left behind by an earlier run
+    lines.clear()
+    assert not run(ex, SYM, fill=True, out=lines.append) and ex.pos == -102
+    assert any("already open" in x for x in lines)
+    lines.clear()
+    assert run(ex, SYM, fill=True, out=lines.append, close_leftover=True) and ex.pos == 0
+
+
+def test_selftest_never_leaves_a_position_when_a_step_blows_up():
+    from pumpfade.selftest import run
+
+    ex = FakeExchange()
+
+    def broken(**p):
+        raise RuntimeError("algo endpoint down")
+
+    ex.new_algo = broken
+    lines = []
+    assert not run(ex, SYM, fill=True, out=lines.append)
+    assert ex.pos == 0 and any("position after close: 0" in x for x in lines)
+
+
+def test_leftover_conditional_orders_are_cleared_before_a_new_entry(env):
+    ex, store, eng, msgs = env
+    ex.algos["stale-T"] = {"type": "TAKE_PROFIT_MARKET", "trigger": 1.5, "status": "NEW", "algoId": 99}
+    eng.open_signals([cand()], DAY)
+    assert ex.algos["stale-T"]["status"] == "CANCELED"
+    assert eng.book.all()[0].status == "entering"
+
+
+def test_entry_is_skipped_when_old_conditional_orders_will_not_go_away(env):
+    ex, store, eng, msgs = env
+    ex.algos["stuck"] = {"type": "STOP_MARKET", "trigger": 1.5, "status": "NEW", "algoId": 7}
+    ex.cancel_all_algos = lambda symbol: None
+    ex.cancel_algo = lambda cid=None, algo_id=None: None
+    notes = eng.open_signals([cand()], DAY)
+    assert eng.book.all() == [] and "could not be removed" in notes[0]
+
+
+def test_close_alerts_when_conditional_orders_survive(env):
+    ex, store, eng, msgs = env
+    eng.open_signals([cand()], DAY)
+    ex.set_price(1.01)
+    eng.tick()
+    ex.cancel_all_algos = lambda symbol: None
+    ex.cancel_algo = lambda cid=None, algo_id=None: None
+    ex.set_price(0.85)                 # take-profit fires; the stop stays behind
+    settle(eng, ex)
+    assert eng.book.all()[0].status == "closed"
+    assert any("may still be open" in m for m in msgs)

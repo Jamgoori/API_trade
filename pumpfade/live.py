@@ -26,7 +26,7 @@ from decimal import Decimal
 from .config import Settings
 from .signals import DAY_MS, HOUR_MS, Candidate
 from .store import Store
-from .trader import fmt
+from .trader import avg_fill_price, fmt
 
 log = logging.getLogger(__name__)
 MIN_MS = 60_000
@@ -205,6 +205,8 @@ class LiveEngine:
         qty = f.qty(margin / float(limit))
         if qty < f.min_qty or qty * limit < f.min_notional:
             return f"{symbol}: skipped, ${margin:,.0f} is below the exchange minimum"
+        if not self._clear_algos(symbol):
+            return f"{symbol}: skipped, old stop/take-profit orders on this coin could not be removed"
         self.tr.prepare_symbol(symbol, 1)
         key = f"m-{day}-{symbol}"
         p = LivePos(key=key, symbol=symbol, sleeve="main", signal_day=day, status="entering", margin=margin,
@@ -229,6 +231,8 @@ class LiveEngine:
             self.store.log_skip(day, BOOK, symbol, f"listing on {venue}: {why}")
             return [f"{symbol}: listing short skipped, {why}"]
         try:
+            if not self._clear_algos(symbol):
+                return [f"{symbol}: listing short skipped, old stop/take-profit orders could not be removed"]
             self.tr.prepare_symbol(symbol, 1)
             bid, ask = self.tr.book_top(symbol)
             f = self.tr.filters(symbol)
@@ -269,7 +273,7 @@ class LiveEngine:
                 raise
         got = float(res.get("executedQty") or 0)
         if got > 0:
-            self._add_fill(p, got, float(res.get("avgPrice") or price))
+            self._add_fill(p, got, avg_fill_price(self.tr, p.symbol, res, p.fb_cid) or float(price))
             p.status = "open"
 
     # ------------------------------------------------------------------ fills and protection
@@ -397,7 +401,7 @@ class LiveEngine:
         new = filled - p.limit_filled
         if new > 1e-12:
             p.limit_filled = filled
-            self._add_fill(p, new, float(o.get("avgPrice") or p.limit_px))
+            self._add_fill(p, new, avg_fill_price(self.tr, p.symbol, o, p.entry_cid) or p.limit_px)
 
     def _close_now(self, p: LivePos, reason: str) -> None:
         for cid in (p.sl_cid, p.tp_cid):
@@ -414,11 +418,23 @@ class LiveEngine:
                               reduceOnly="true", newClientOrderId=p.close_cid)
         self.book.save(p)
 
-    def _finalize(self, p: LivePos, now: int) -> None:
+    def _clear_algos(self, symbol: str) -> bool:
+        """Remove every conditional order left on the symbol and check that none remain."""
         try:
-            self.tr.cancel_all_algos(p.symbol)
+            if not self.tr.open_algos(symbol):
+                return True
+            self.tr.cancel_all_algos(symbol)
+            for a in self.tr.open_algos(symbol):
+                self.tr.cancel_algo(algo_id=a.get("algoId"))
+            return not self.tr.open_algos(symbol)
         except Exception:
-            pass
+            log.exception("could not clear the conditional orders on %s", symbol)
+            return False
+
+    def _finalize(self, p: LivePos, now: int) -> None:
+        if not self._clear_algos(p.symbol):
+            self.notify(f"{p.symbol}: stop/take-profit orders may still be open after the close. Cancel them in the "
+                        f"Binance app; the bot will not trade this coin until they are gone", level="critical")
         try:
             self.tr.cancel_all_orders(p.symbol)
         except Exception:

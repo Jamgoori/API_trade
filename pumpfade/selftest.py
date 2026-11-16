@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 
-from .trader import BinanceTrader
+from .trader import BinanceTrader, avg_fill_price
 
 
 def diagnose(trader, equity: float | None, out=print) -> bool:
@@ -48,7 +48,41 @@ def diagnose(trader, equity: float | None, out=print) -> bool:
     return good
 
 
-def run(trader: BinanceTrader, symbol: str, fill: bool, out=print) -> bool:
+def algo_status(res) -> str:
+    if not res:
+        return "not found"
+    return res.get("algoStatus") or f"unexpected response {str(res)[:300]}"
+
+
+def expect_algos(trader, symbol: str, n: int) -> str:
+    rows = trader.open_algos(symbol)
+    if len(rows) != n:
+        raise AssertionError(f"expected {n} open conditional orders, found {len(rows)}: {str(rows)[:300]}")
+    return f"{n} open"
+
+
+def close_position(trader, symbol: str, out=print) -> float:
+    """Cancel the symbol's orders and buy back a short at market. Returns what is left."""
+    for fn in (trader.cancel_all_algos, trader.cancel_all_orders):
+        try:
+            fn(symbol)
+        except Exception as exc:
+            out(f"  WARN cleanup: {exc}")
+    amt = trader.positions().get(symbol, 0.0)
+    if amt:
+        f = trader.filters(symbol)
+        try:
+            trader.new_order(symbol=symbol, side="BUY" if amt < 0 else "SELL", type="MARKET",
+                             quantity=f.qty(abs(amt)), reduceOnly="true",
+                             newClientOrderId=f"pf-selftest-X{int(time.time()) % 100000}")
+        except Exception as exc:
+            out(f"  WARN closing {symbol}: {exc}")
+        time.sleep(1)
+        amt = trader.positions().get(symbol, 0.0)
+    return amt
+
+
+def run(trader: BinanceTrader, symbol: str, fill: bool, out=print, close_leftover: bool = False) -> bool:
     ok = True
 
     def step(name, fn):
@@ -81,6 +115,17 @@ def run(trader: BinanceTrader, symbol: str, fill: bool, out=print) -> bool:
     f = step("symbol filters", lambda: trader.filters(symbol))
     if f is None:
         return False
+    if fill:
+        before = trader.positions().get(symbol, 0.0)
+        if before and close_leftover:
+            left = close_position(trader, symbol, out)
+            out(f"  {'OK  ' if not left else 'FAIL'} closed the leftover {symbol} position {before}: left {left}")
+            if left:
+                return False
+        elif before:
+            out(f"  FAIL a {symbol} position ({before}) is already open, probably left by an earlier selftest. "
+                f"Close it in the Binance app, or run the selftest again with --close-leftover")
+            return False
     step("isolated margin, 1x", lambda: trader.prepare_symbol(symbol, 1))
     bid, ask = trader.book_top(symbol)
     qty = f.qty(max(float(f.min_notional) * 1.2 / bid, float(f.min_qty)))
@@ -97,33 +142,58 @@ def run(trader: BinanceTrader, symbol: str, fill: bool, out=print) -> bool:
     step(f"place algo STOP_MARKET (reduce-only) @ {stop_far}", lambda: trader.new_algo(
         symbol=symbol, side="BUY", type="STOP_MARKET", triggerPrice=stop_far, quantity=qty, reduceOnly="true",
         workingType="CONTRACT_PRICE", clientAlgoId=f"pf-selftest-A{tag}").get("algoStatus"))
-    step("query it", lambda: (trader.query_algo(f"pf-selftest-A{tag}") or {}).get("algoStatus"))
+    step("query it", lambda: algo_status(trader.query_algo(f"pf-selftest-A{tag}")))
+    step("open conditional orders list it", lambda: expect_algos(trader, symbol, 1))
     step("cancel it", lambda: trader.cancel_algo(f"pf-selftest-A{tag}"))
+    step("none left after cancel", lambda: expect_algos(trader, symbol, 0))
     if fill:
-        price = f.price(bid * 0.997, up=True)
-        res = step(f"open a minimum short: IOC sell {qty} @ {price}", lambda: trader.new_order(
-            symbol=symbol, side="SELL", type="LIMIT", timeInForce="IOC", quantity=qty, price=price,
-            newClientOrderId=f"pf-selftest-O{tag}"))
-        filled = float(res["executedQty"]) if res else 0.0
-        if filled <= 0:
-            out("  FAIL nothing filled; skipping the protection and close checks")
-            return False
-        entry = float(res["avgPrice"])
-        step("protect: STOP_MARKET closePosition +15%", lambda: trader.new_algo(
-            symbol=symbol, side="BUY", type="STOP_MARKET", triggerPrice=f.price(entry * 1.15, up=True),
-            closePosition="true", workingType="CONTRACT_PRICE", clientAlgoId=f"pf-selftest-S{tag}").get("algoStatus"))
-        step("protect: TAKE_PROFIT_MARKET closePosition −15%", lambda: trader.new_algo(
-            symbol=symbol, side="BUY", type="TAKE_PROFIT_MARKET", triggerPrice=f.price(entry * 0.85, up=False),
-            closePosition="true", workingType="CONTRACT_PRICE", clientAlgoId=f"pf-selftest-T{tag}").get("algoStatus"))
-        step("position shows up", lambda: trader.positions().get(symbol))
-        step("cancel protection", lambda: (trader.cancel_algo(f"pf-selftest-S{tag}"), trader.cancel_algo(f"pf-selftest-T{tag}")) and "")
-        step("close at market (reduce-only)", lambda: trader.new_order(
-            symbol=symbol, side="BUY", type="MARKET", quantity=f.qty(filled), reduceOnly="true",
-            newClientOrderId=f"pf-selftest-C{tag}")["status"])
-        time.sleep(1)
-        left = trader.positions().get(symbol, 0.0)
-        out(f"  {'OK  ' if not left else 'FAIL'} position after close: {left}")
-        ok = ok and not left
+        try:
+            ok = fill_test(trader, symbol, f, qty, bid, tag, step, out) and ok
+        finally:
+            left = trader.positions().get(symbol, 0.0)
+            if left:  # never leave a test position behind, whatever failed above
+                left = close_position(trader, symbol, out)
+            out(f"  {'OK  ' if not left else 'FAIL'} position after close: {left}")
+            ok = ok and not left
         step("fills are readable", lambda: f"{len(trader.user_trades(symbol, int(time.time() * 1000) - 600_000))} fills")
     out("ALL OK" if ok else "SOMETHING FAILED: do not run live until it passes")
     return ok
+
+
+def fill_test(trader, symbol, f, qty, bid, tag, step, out) -> bool:
+    """Open a minimum short, protect it like the bot does, then close it. False when the short did not open."""
+    price = f.price(bid * 0.997, up=True)
+    cid = f"pf-selftest-O{tag}"
+    got = {}
+
+    def open_short():
+        got["res"] = trader.new_order(symbol=symbol, side="SELL", type="LIMIT", timeInForce="IOC", quantity=qty,
+                                      price=price, newClientOrderId=cid)
+        return f"{got['res'].get('status')}, filled {got['res'].get('executedQty')}"
+
+    step(f"open a minimum short: IOC sell {qty} @ {price}", open_short)
+    res = got.get("res") or {}
+    filled = float(res.get("executedQty") or 0)
+    if filled <= 0:
+        out("  FAIL nothing filled; skipping the protection and close checks")
+        return False
+    entry = avg_fill_price(trader, symbol, res, cid)
+    out(f"  {'OK  ' if entry else 'FAIL'} fill price read back: {entry}")
+    if not entry:
+        return False
+    step("protect: STOP_MARKET closePosition +15%", lambda: trader.new_algo(
+        symbol=symbol, side="BUY", type="STOP_MARKET", triggerPrice=f.price(entry * 1.15, up=True),
+        closePosition="true", workingType="CONTRACT_PRICE", clientAlgoId=f"pf-selftest-S{tag}").get("algoStatus"))
+    step("protect: TAKE_PROFIT_MARKET closePosition −15%", lambda: trader.new_algo(
+        symbol=symbol, side="BUY", type="TAKE_PROFIT_MARKET", triggerPrice=f.price(entry * 0.85, up=False),
+        closePosition="true", workingType="CONTRACT_PRICE", clientAlgoId=f"pf-selftest-T{tag}").get("algoStatus"))
+    step("position shows up", lambda: trader.positions().get(symbol))
+    step("both are listed", lambda: expect_algos(trader, symbol, 2))
+    step("cancel protection", lambda: (trader.cancel_algo(f"pf-selftest-S{tag}"),
+                                       trader.cancel_algo(f"pf-selftest-T{tag}")) and "")
+    step("none left after cancel", lambda: expect_algos(trader, symbol, 0))
+    step("close at market (reduce-only)", lambda: trader.new_order(
+        symbol=symbol, side="BUY", type="MARKET", quantity=f.qty(filled), reduceOnly="true",
+        newClientOrderId=f"pf-selftest-C{tag}")["status"])
+    time.sleep(1)
+    return True
