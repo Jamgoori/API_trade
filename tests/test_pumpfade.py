@@ -307,3 +307,44 @@ def test_a_listing_stop_does_not_drop_the_coin(tmp_path):
     eng.tick()
     assert store.legs()[0].exit_reason == "stop"
     assert not store.is_banned("limit", "TGTUSDT")
+
+
+def test_a_failed_scan_is_retried_until_the_deadline(tmp_path):
+    from pumpfade.runner import Runner
+
+    s = Settings(db_path=tmp_path / "r.sqlite", watch_listings=False)
+    now = [ENTRY - 10 * MIN]
+    sent = []
+
+    class Notes:
+        def send(self, msg, **kw):
+            sent.append(msg)
+
+    class Idle:
+        def tick(self):
+            pass
+
+        def settle_all_funding(self):
+            pass
+
+    r = Runner(s, client=object(), store=Store(s.db_path), notifier=Notes(), clock=lambda: now[0])
+    r.engine = Idle()
+    r.step()                                   # started before the close: waits for it
+    calls = []
+
+    def flaky(day):
+        calls.append(day)
+        if len(calls) == 1:
+            raise ConnectionError("wifi dropped")
+        return "scanned"
+
+    r.scan_and_enter = flaky
+    now[0] = ENTRY + 61_000
+    r.step()
+    assert r.store.get("last_scan_day") == DAY - 1 and "retrying" in sent[-1]
+    now[0] += 30_000
+    r.step()
+    assert calls == [DAY, DAY] and r.store.get("last_scan_day") == DAY and sent[-1] == "scanned"
+    now[0] += 30_000
+    r.step()
+    assert len(calls) == 2                     # done for the day

@@ -73,12 +73,15 @@ class Runner:
             if since <= self.settings.scan_deadline_s * 1000:
                 try:
                     self.notifier.send(self.scan_and_enter(target))
-                except Exception as exc:
+                    self.store.put("last_scan_day", target)
+                except Exception as exc:  # e.g. the network dropped: try again on the next step until the deadline
                     log.exception("scan failed")
-                    self.notifier.send(f"scan for {kst(target)} failed: {exc}", level="error")
+                    self.notifier.send(f"scan for {kst(target)} failed, retrying until 09:30 KST: {exc}", level="error",
+                                       key=f"scan-{target}", throttle_s=3600)
             else:
-                self.notifier.send(f"missed the {kst(target)} 09:00 KST scan (bot was not running)", level="warning")
-            self.store.put("last_scan_day", target)
+                self.notifier.send(f"missed the {kst(target)} 09:00 KST scan (the bot was not running, or the scan "
+                                   f"kept failing until 09:30)", level="warning")
+                self.store.put("last_scan_day", target)
         if self.watcher is not None:
             try:
                 self.watcher.poll()
