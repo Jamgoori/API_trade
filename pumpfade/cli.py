@@ -11,11 +11,35 @@ from .config import Settings
 from .signals import DAY_MS
 
 
+def single_instance(db_path):
+    """Hold an exclusive lock next to the database so two live bots can never trade the same account book."""
+    import os
+    from pathlib import Path
+
+    path = Path(str(db_path) + ".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        raise SystemExit(f"another pumpfade live process is already using {db_path}: stop it first "
+                         "(close its window, or stop the scheduled task / pumpfade-live service)")
+    return fh
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(prog="pumpfade", description="Small-cap pump fade on Binance (paper mode)")
     ap.add_argument("--base-url", help="Binance futures REST base (default https://fapi.binance.com)")
     ap.add_argument("--db", help="SQLite file (default data/pumpfade.sqlite)")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--log-file", help="also write the log to this file (UTF-8, rotated at 5 MB)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sc = sub.add_parser("scan", help="show which coins qualify for a UTC day (no positions are opened)")
     sc.add_argument("--date", help="UTC date of the +20%% day, YYYY-MM-DD (default: the day that closed last)")
@@ -37,8 +61,14 @@ def main(argv=None) -> None:
     ss.add_argument("--live", action="store_true")
     a = ap.parse_args(argv)
 
+    handlers = [logging.StreamHandler()]
+    if a.log_file:
+        from logging.handlers import RotatingFileHandler
+        from pathlib import Path
+        Path(a.log_file).parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(RotatingFileHandler(a.log_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8"))
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s", handlers=handlers)
     logging.getLogger("urllib3").setLevel(logging.WARNING)  # its DEBUG lines print full URLs
     s = Settings.from_env()
     if a.base_url:
@@ -81,6 +111,7 @@ def main(argv=None) -> None:
     if live_cmd and not a.db:
         from pathlib import Path
         s.db_path = Path(str(s.db_path).replace(".sqlite", "-live.sqlite"))
+    lock = single_instance(s.db_path) if a.cmd in ("live", "flatten") else None  # noqa: F841 (held until exit)
     r = Runner(s, trader=trader)
     if a.cmd == "paper":
         r.run_forever()

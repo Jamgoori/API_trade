@@ -510,3 +510,14 @@ def test_close_alerts_when_conditional_orders_survive(env):
     settle(eng, ex)
     assert eng.book.all()[0].status == "closed"
     assert any("may still be open" in m for m in msgs)
+
+
+def test_a_second_live_process_on_the_same_database_is_refused(tmp_path):
+    from pumpfade.cli import single_instance
+
+    held = single_instance(tmp_path / "live.sqlite")
+    with pytest.raises(SystemExit) as ei:
+        single_instance(tmp_path / "live.sqlite")
+    assert "already using" in str(ei.value)
+    held.close()
+    single_instance(tmp_path / "live.sqlite").close()  # free again once the first one exits

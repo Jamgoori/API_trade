@@ -204,6 +204,35 @@ PC에서 직접 돌릴 땐 `python -m pumpfade live --i-understand-live` 예요.
 sudo systemctl restart pumpfade-live
 ```
 
+### 윈도우에서 자동 시작
+
+윈도우는 업데이트로 재부팅되면 봇이 꺼져요. 작업 스케줄러에 등록해두면 컴퓨터가 켜질 때 **로그인하지 않아도** 봇이 켜지고, 봇이 꺼지면 30초 뒤 다시 켜요.
+
+1. 직접 켜둔 봇 창이 있으면 Ctrl+C로 먼저 끄세요(봇은 두 개가 동시에 못 돌게 막혀 있어요).
+2. 시작 버튼에서 PowerShell을 **마우스 오른쪽 → 관리자 권한으로 실행**해요.
+
+```bash
+cd $HOME\API_trade
+```
+
+```bash
+powershell -ExecutionPolicy Bypass -File deploy\windows\install_autostart.ps1
+```
+
+로그 보기:
+
+```bash
+Get-Content data\pumpfade-live.log -Tail 30 -Wait
+```
+
+멈추기 (`-Remove`를 쓰면 자동 시작까지 지워요):
+
+```bash
+powershell -ExecutionPolicy Bypass -File deploy\windows\install_autostart.ps1 -Stop
+```
+
+코드를 업데이트(`git pull`)한 뒤에는 `-Stop`으로 멈추고 `Start-ScheduledTask pumpfade-live`로 다시 켜요.
+
 ### 확인과 비상 정리
 
 ```bash
