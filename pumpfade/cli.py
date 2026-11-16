@@ -34,6 +34,44 @@ def single_instance(db_path):
     return fh
 
 
+def telegram_check(token: str | None, chat: str | None, out=print) -> bool:
+    """Find the chat id for TELEGRAM_CHAT_ID, or send a test message when both are set."""
+    import requests
+
+    if not token:
+        out("TELEGRAM_BOT_TOKEN is empty: put the token from @BotFather into .env first")
+        return False
+    base = f"https://api.telegram.org/bot{token}"
+    try:
+        if not chat:
+            body = requests.get(f"{base}/getUpdates", timeout=10).json()
+            if not body.get("ok"):
+                out(f"Telegram refused the token: {body.get('description')}. Check TELEGRAM_BOT_TOKEN in .env")
+                return False
+            chats = {}
+            for u in body.get("result", []):
+                c = (u.get("message") or u.get("channel_post") or {}).get("chat") or {}
+                if "id" in c:
+                    chats[c["id"]] = c.get("username") or c.get("first_name") or c.get("title") or ""
+            if not chats:
+                out("no messages yet: open your bot in Telegram, press Start (or send hi), then run this again")
+                return False
+            for cid, name in chats.items():
+                out(f"found chat {name}: put this line into .env ->  TELEGRAM_CHAT_ID={cid}")
+            return True
+        body = requests.post(f"{base}/sendMessage", json={"chat_id": chat, "text": "✅ pumpfade alerts work"},
+                             timeout=10).json()
+        if body.get("ok"):
+            out("test message sent: check Telegram. Restart the bot so it picks up the new settings")
+            return True
+        out(f"Telegram refused the message: {body.get('description')}. Check TELEGRAM_CHAT_ID, and press Start "
+            "in the bot chat")
+        return False
+    except requests.RequestException as exc:
+        out(f"could not reach Telegram: {str(exc).replace(token, '<token>')}")
+        return False
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(prog="pumpfade", description="Small-cap pump fade on Binance (paper mode)")
     ap.add_argument("--base-url", help="Binance futures REST base (default https://fapi.binance.com)")
@@ -59,6 +97,7 @@ def main(argv=None) -> None:
     rp.add_argument("--live", action="store_true")
     ss = sub.add_parser("status", help="open positions (paper, or live with --live)")
     ss.add_argument("--live", action="store_true")
+    sub.add_parser("telegram", help="set up alerts: find TELEGRAM_CHAT_ID, then send a test message")
     a = ap.parse_args(argv)
 
     handlers = [logging.StreamHandler()]
@@ -76,6 +115,9 @@ def main(argv=None) -> None:
     if a.db:
         from pathlib import Path
         s.db_path = Path(a.db)
+
+    if a.cmd == "telegram":
+        raise SystemExit(0 if telegram_check(s.telegram_token, s.telegram_chat) else 1)
 
     if a.cmd == "scan":
         from .binance import BinancePublic

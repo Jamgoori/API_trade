@@ -81,7 +81,12 @@ python -m pumpfade status
 기록은 `data/pumpfade.sqlite`에 쌓여요. 봇을 껐다 켜도 이어서 기록해요.
 
 ### 텔레그램 알림 (선택)
-`.env`에 `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`를 넣으면 진입·청산·매일 요약을 보내줘요. hedgebot과 같은 설정을 써요.
+`.env`에 `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`를 넣으면 진입·청산·매일 요약을 보내줘요.
+
+1. 텔레그램에서 **@BotFather**(파란 체크)를 찾아 `/newbot` → 봇 이름 → `bot`으로 끝나는 아이디를 정하면 **토큰**을 줘요.
+2. BotFather가 준 링크로 내 봇에 들어가 **시작(Start)** 을 눌러요.
+3. `.env`에 `TELEGRAM_BOT_TOKEN=토큰`을 넣고 `python -m pumpfade telegram`을 실행하면 `TELEGRAM_CHAT_ID=...` 줄을 알려줘요. 그 줄을 `.env`에 넣어요.
+4. `python -m pumpfade telegram`을 한 번 더 실행하면 테스트 메시지가 와요. 그다음 봇을 재시작해요.
 
 ## 리포트 읽는 법
 

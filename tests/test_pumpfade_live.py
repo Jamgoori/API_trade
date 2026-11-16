@@ -521,3 +521,30 @@ def test_a_second_live_process_on_the_same_database_is_refused(tmp_path):
     assert "already using" in str(ei.value)
     held.close()
     single_instance(tmp_path / "live.sqlite").close()  # free again once the first one exits
+
+
+def test_telegram_setup_finds_the_chat_then_sends_a_test(monkeypatch):
+    import requests
+
+    from pumpfade.cli import telegram_check
+
+    class R:
+        def __init__(self, body):
+            self.body = body
+
+        def json(self):
+            return self.body
+
+    token = "123:ABC" + "x" * 30
+    monkeypatch.setattr(requests, "get", lambda url, **k: R({"ok": True, "result": [
+        {"message": {"chat": {"id": 4242, "first_name": "me"}}}]}))
+    sent = []
+    monkeypatch.setattr(requests, "post", lambda url, json=None, **k: sent.append(json) or R({"ok": True}))
+    lines = []
+    assert telegram_check(token, None, lines.append) and "TELEGRAM_CHAT_ID=4242" in lines[0]
+    assert telegram_check(token, "4242", lines.append) and sent[0]["chat_id"] == "4242"
+    assert not telegram_check(None, None, lines.append)
+    monkeypatch.setattr(requests, "get", lambda url, **k: R({"ok": True, "result": []}))
+    lines.clear()
+    assert not telegram_check(token, None, lines.append) and "press Start" in lines[0]
+    assert not any(token in x for x in lines)
