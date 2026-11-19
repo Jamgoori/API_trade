@@ -641,3 +641,12 @@ def test_heartbeat_pings_every_five_minutes(monkeypatch, tmp_path):
     r.heartbeat(now[0] + 60_000)
     r.heartbeat(now[0] + 5 * 60_000)
     assert pings == ["https://hc-ping.example/abc"] * 2
+
+
+def test_a_long_gap_in_the_loop_is_reported():
+    from pumpfade.runner import keep_awake, pause_note
+
+    assert pause_note(1_000_000.0, 1_000_000.0 + 60) is None
+    msg = pause_note(1_763_400_000.0, 1_763_400_000.0 + 34 * 3600)
+    assert "paused for 34.0h" in msg and "asleep" in msg
+    assert keep_awake() is False          # not Windows here: nothing to do

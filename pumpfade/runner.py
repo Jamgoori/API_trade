@@ -18,6 +18,33 @@ from .store import Store
 
 log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
+PAUSE_ALERT_S = 300  # a loop gap longer than this means the computer slept or the process was frozen
+
+
+def keep_awake() -> bool:
+    """Ask Windows not to sleep on idle while the bot runs (no effect elsewhere). Lid and power-button actions still
+    apply, so the power plan must also say "do nothing" when the lid closes."""
+    import os
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        es_continuous, es_system_required = 0x80000000, 0x00000001
+        return bool(ctypes.windll.kernel32.SetThreadExecutionState(es_continuous | es_system_required))
+    except Exception:
+        log.warning("could not ask Windows to stay awake", exc_info=True)
+        return False
+
+
+def pause_note(last_s: float, now_s: float) -> str | None:
+    """A warning when the loop was not running for a while (sleep, hibernation, frozen process)."""
+    gap = now_s - last_s
+    if gap < PAUSE_ALERT_S:
+        return None
+    a = datetime.fromtimestamp(last_s, KST).strftime("%m-%d %H:%M")
+    b = datetime.fromtimestamp(now_s, KST).strftime("%m-%d %H:%M")
+    return (f"⚠️ the bot was paused for {gap / 3600:.1f}h ({a} → {b} KST). The computer was probably asleep: "
+            "check the power settings (sleep never, lid closes → do nothing)")
 
 
 def kst(day: int) -> str:
@@ -156,14 +183,22 @@ class Runner:
         return render(self.store, [b.name for b in self.settings.books], self.settings.start_equity)
 
     def run_forever(self, interval_s: float = 30.0) -> None:
+        if keep_awake():
+            log.info("Windows will not sleep on idle while the bot runs")
         if self.live:
             self.notifier.send("LIVE bot started\n" + self.engine.report())
         else:
             self.notifier.send(f"paper bot started, books: {', '.join(b.name for b in self.settings.books)}")
+        last, pending = time.time(), None
         while True:
+            pending = pause_note(last, time.time()) or pending
             try:
                 self.step()
+                if pending:  # sent once a step works, i.e. once the network is back after waking up
+                    self.notifier.send(pending, level="warning")
+                    pending = None
             except Exception as exc:
                 log.exception("step failed")
                 self.notifier.send(f"step failed: {exc}", level="error", key="step", throttle_s=3600)
+            last = time.time()
             time.sleep(interval_s)
