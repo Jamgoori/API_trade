@@ -22,15 +22,19 @@ PAUSE_ALERT_S = 300  # a loop gap longer than this means the computer slept or t
 
 
 def keep_awake() -> bool:
-    """Ask Windows not to sleep on idle while the bot runs (no effect elsewhere). Lid and power-button actions still
-    apply, so the power plan must also say "do nothing" when the lid closes."""
+    """Ask Windows not to sleep on idle while the bot runs (no effect elsewhere).
+
+    Modern Standby laptops enter standby as soon as the display turns off on idle, so the display is held on too;
+    with the lid closed the panel is off anyway. Lid and power-button actions still apply, so the power plan must
+    say "do nothing" when the lid closes."""
     import os
     if os.name != "nt":
         return False
     try:
         import ctypes
-        es_continuous, es_system_required = 0x80000000, 0x00000001
-        return bool(ctypes.windll.kernel32.SetThreadExecutionState(es_continuous | es_system_required))
+        es_continuous, es_system_required, es_display_required = 0x80000000, 0x00000001, 0x00000002
+        return bool(ctypes.windll.kernel32.SetThreadExecutionState(
+            es_continuous | es_system_required | es_display_required))
     except Exception:
         log.warning("could not ask Windows to stay awake", exc_info=True)
         return False
