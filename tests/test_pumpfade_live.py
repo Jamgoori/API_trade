@@ -650,3 +650,33 @@ def test_a_long_gap_in_the_loop_is_reported():
     msg = pause_note(1_763_400_000.0, 1_763_400_000.0 + 34 * 3600)
     assert "paused for 34.0h" in msg and "asleep" in msg
     assert keep_awake() is False          # not Windows here: nothing to do
+
+
+def _fallback_at(env, px):
+    ex, store, eng, msgs = env
+    eng.open_signals([cand()], DAY)   # 09:00 open 1.0, limit 1.005
+    ex.set_price(px)
+    ex.now = ENTRY + HOUR_MS + 30_000
+    eng.tick()
+    return eng.book.all()[0]
+
+
+def test_fallback_below_the_0900_open_aims_at_the_limits_take_profit(env):
+    p = _fallback_at(env, 0.95)
+    assert p.status == "open" and p.entry_avg == pytest.approx(0.95 * 0.999)
+    assert p.tp_px == pytest.approx(0.8542, abs=1e-4)          # 1.005 × 0.85, not entry × 0.85 (≈ 0.8067)
+    assert p.sl_px == pytest.approx(0.95 * 0.999 * 1.15, abs=1e-4)
+
+
+def test_fallback_above_the_0900_open_takes_profit_15pct_below_its_entry(env):
+    ex, store, eng, msgs = env
+    p = _fallback_at(env, 1.003)       # above the open, under the 1.005 limit, so the limit never filled
+    assert p.status == "open" and p.entry_avg == pytest.approx(1.003 * 0.999)
+    assert p.tp_px == pytest.approx(1.003 * 0.999 * 0.85, abs=1e-4)
+
+
+def test_no_fallback_entry_when_the_price_is_already_at_the_0900_take_profit(env):
+    ex, store, eng, msgs = env
+    p = _fallback_at(env, 0.85)
+    assert p.status == "failed" and ex.pos == 0 and "already at the 09:00 take-profit" in p.note
+    assert any("no position" in m for m in msgs)

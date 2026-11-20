@@ -299,16 +299,25 @@ class LiveEngine:
         head = "SHORT opened" if p.alerted_qty == 0 else "entry complete"
         self.notify(f"📉 [live/{p.sleeve}] {p.symbol} {head}: {p.qty:g} @ {p.entry_avg or 0:.6g} "
                     f"(${p.qty * (p.entry_avg or 0):,.0f}), stop {p.sl_px or 0:.6g} (+15%), "
-                    f"TP {p.tp_px or 0:.6g} (−15%), time exit {exit_at:%m-%d %H:%M} KST")
+                    f"TP {p.tp_px or 0:.6g} ({(p.tp_px or 0) / (p.entry_avg or 1) - 1:+.1%}), "
+                    f"time exit {exit_at:%m-%d %H:%M} KST")
         p.alerted_qty = p.qty
+
+    def _tp_price(self, p: LivePos) -> float:
+        """Take-profit level. Main-rule entries below the 09:00 KST open (the 10:00 fallback after a drop) aim at the
+        level the +0.5% limit was aiming at; everything else takes profit 15% below its own average entry."""
+        if p.sleeve == "main" and p.limit_px and p.ref_px and p.entry_avg < p.ref_px:
+            return p.limit_px * (1 - self.st.take_profit)
+        return p.entry_avg * (1 - self.st.take_profit)
 
     def _protect(self, p: LivePos) -> None:
         """Place (or move) the closePosition stop and take-profit around the current average entry."""
         f = self.tr.filters(p.symbol)
         sl = f.price(p.entry_avg * (1 + self.st.stop), up=True)
-        tp = f.price(p.entry_avg * (1 - self.st.take_profit), up=False)
-        if p.sl_px and abs(float(sl) / p.sl_px - 1) < 0.002 and p.sl_cid:
-            return  # already protected at (about) this level
+        tp = f.price(self._tp_price(p), up=False)
+        if (p.sl_px and abs(float(sl) / p.sl_px - 1) < 0.002 and p.sl_cid
+                and p.tp_px and abs(float(tp) / p.tp_px - 1) < 0.002):
+            return  # already protected at (about) these levels
         old = (p.sl_cid, p.tp_cid)
         n = self.clock() // 1000 % 100000
         p.sl_cid, p.tp_cid = f"pf-{p.symbol}-S{n}"[:36], f"pf-{p.symbol}-T{n}"[:36]
@@ -385,6 +394,9 @@ class LiveEngine:
             bid, _ = self.tr.book_top(p.symbol)
             if now - p.limit_until_ms > FALLBACK_LATE_MS:
                 p.note = "the 10:00 KST IOC was skipped: the bot was not running at 10:00"
+            elif bid <= p.limit_px * (1 - self.st.take_profit):
+                p.note = (f"the 10:00 KST IOC was skipped: the price ({bid:.6g}) is already at the 09:00 take-profit "
+                          f"level ({p.limit_px * (1 - self.st.take_profit):.6g})")
             elif remaining >= f.min_qty and float(remaining) * bid >= float(f.min_notional):
                 self._ioc_sell(p, remaining)
             if p.qty <= 0:
