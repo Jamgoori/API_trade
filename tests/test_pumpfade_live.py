@@ -691,3 +691,37 @@ def test_weaker_long_short_ratio_takes_half_size(env):
     assert by[SYM].margin == pytest.approx(1200)                      # ratio 2.5: full 12%
     assert by["WEAKUSDT"].margin == pytest.approx(600)                # ratio 1.8: 6%
     assert by["EDGEUSDT"].margin == pytest.approx(600)                # exactly 2.0 is not above the line
+
+
+def test_position_size_is_capped_for_large_accounts(env):
+    ex, store, eng, msgs = env
+    ex.cash = 200_000                  # 12% would be $24,000
+    eng._account_cache = None
+    eng.open_signals([cand()], DAY)
+    assert eng.book.all()[0].margin == pytest.approx(10_000)
+
+
+def test_a_failed_time_exit_keeps_the_stop_in_place(env):
+    ex, store, eng, msgs = env
+    eng.open_signals([cand()], DAY)
+    ex.set_price(1.01)
+    eng.tick()
+    p = eng.book.all()[0]
+    real = ex.new_order
+
+    def down(**kw):
+        if kw.get("type") == "MARKET":
+            raise RuntimeError("network down")
+        return real(**kw)
+
+    ex.new_order = down
+    ex.now = p.deadline_ms + MIN
+    eng.tick()                          # the market buy fails
+    assert eng.book.all()[0].status == "closing" and ex.pos != 0
+    assert open_algos(ex) == ["STOP_MARKET", "TAKE_PROFIT_MARKET"]   # still protected
+    ex.new_order = real
+    ex.now += 3 * MIN
+    eng.tick()                          # retried after two minutes
+    settle(eng, ex)
+    p = eng.book.all()[0]
+    assert ex.pos == 0 and p.status == "closed" and p.exit_reason == "time" and open_algos(ex) == []

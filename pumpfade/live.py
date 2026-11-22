@@ -174,6 +174,8 @@ class LiveEngine:
         if symbol in self._positions(fresh=True):
             return 0.0, "the account already has a position in this coin"
         margin = rs["equity"] * rs["fraction"] * scale
+        if self.settings.max_trade_usd > 0:
+            margin = min(margin, self.settings.max_trade_usd)
         if sum(p.margin for p in active) + margin > self.settings.max_margin_used * rs["equity"] * (1 + 1e-9):
             return 0.0, "margin limit reached"
         return margin, ""
@@ -435,13 +437,13 @@ class LiveEngine:
             self._add_fill(p, new, avg_fill_price(self.tr, p.symbol, o, p.entry_cid) or p.limit_px)
 
     def _close_now(self, p: LivePos, reason: str) -> None:
-        for cid in (p.sl_cid, p.tp_cid):
-            if cid:
-                self.tr.cancel_algo(cid)
+        """Buy the short back at market. The stop and take-profit stay in place until the position is gone
+        (_finalize removes them), so a failed close never leaves the position unprotected."""
         amt = self._positions(fresh=True).get(p.symbol, 0.0)
         p.exit_reason = reason
         p.status = "closing"
         p.close_sent_ms = self.clock()
+        self.book.save(p)
         if amt:
             f = self.tr.filters(p.symbol)
             p.close_cid = f"pf-{p.symbol}-X{self.clock() // 1000 % 100000}"[:36]

@@ -56,6 +56,7 @@ class Settings:
     start_equity: float = 10_000.0
     margin_fraction: float = 0.12      # margin per signal as a share of the book's equity (STRATEGY.md)
     max_margin_used: float = 0.90      # never commit more than this share of equity as margin
+    max_trade_usd: float = 10_000.0    # live: cap per position; small-cap books get thin above ~$10k (0 = no cap)
     scan_delay_s: int = 60             # run the daily scan this long after 00:00 UTC (funding settles first)
     scan_deadline_s: int = 30 * 60     # a scan later than this after 00:00 UTC is skipped as stale
     # live trading (pumpfade live): keys from BINANCE_API_KEY / BINANCE_API_SECRET, never from files in the repo
@@ -92,6 +93,7 @@ class Settings:
         s.api_key = os.getenv("BINANCE_API_KEY") or None
         s.api_secret = os.getenv("BINANCE_API_SECRET") or None
         s.live_margin_fraction = float(os.getenv("PUMPFADE_LIVE_MARGIN_FRACTION", s.live_margin_fraction))
+        s.max_trade_usd = float(os.getenv("PUMPFADE_MAX_TRADE_USD", s.max_trade_usd))
         s.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN") or None
         s.telegram_chat = os.getenv("TELEGRAM_CHAT_ID") or None
         s.heartbeat_url = os.getenv("PUMPFADE_HEARTBEAT_URL") or None

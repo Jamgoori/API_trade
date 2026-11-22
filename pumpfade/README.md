@@ -151,7 +151,7 @@ python -m pumpfade status
 | 09:01 | 신호 코인마다 격리(isolated) 1배로 맞추고, 09:00 시가 +0.5%에 **숏 지정가(GTC)** 를 걸어요. 수량은 계정 자산 × 신호당 비율이고, 롱숏비율이 2.0 이하인 신호는 그 절반이에요(12%면 6%) |
 | 09:01~10:00 | 일부라도 체결되면 바로 **손절 +15%(STOP_MARKET)** 와 **익절 −15%(TAKE_PROFIT_MARKET)** 를 거래소에 걸어요. 둘 다 `closePosition`이라 포지션 전체를 닫아요 |
 | 10:00 | 남은 지정가를 취소하고 나머지를 IOC로 팔아요. 최우선 매수호가에서 −0.3%보다 싼 가격엔 안 팔아요. 이때 진입가가 09:00 시가보다 낮으면 익절은 **지정가가 노렸던 가격(09:00 시가 × 1.005 × 0.85)** 에 걸고, 가격이 이미 그 아래면 진입하지 않아요 |
-| 진입 48시간 후 | 남아 있으면 시장가(reduceOnly)로 사서 정리해요 |
+| 진입 48시간 후 | 남아 있으면 시장가(reduceOnly)로 사서 정리해요. 손절·익절 주문은 포지션이 없어진 걸 확인한 뒤에 지워서, 청산이 실패해도 보호가 남아요 |
 
 상장빔은 예정 시각에 IOC(최대 −0.3%)로 바로 숏을 잡고, 손절·익절·48시간은 똑같아요.
 
@@ -304,6 +304,7 @@ sudo systemctl start pumpfade-live
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | 없음 | 실계정 API 키 (`.env`에만) |
 | `BINANCE_TESTNET_API_KEY` / `BINANCE_TESTNET_API_SECRET` | 없음 | 테스트넷 키 (`selftest`용) |
 | `PUMPFADE_LIVE_MARGIN_FRACTION` | 0.05 | 신호당 증거금 비율. 점검 후 0.12 |
+| `PUMPFADE_MAX_TRADE_USD` | 10000 | 한 건 최대 금액. 계좌가 약 8만 달러를 넘으면 이 상한이 걸려요 |
 
 낙폭 기준(−25% / −35%)과 최대 증거금 사용(90%)은 `pumpfade/config.py`의 `Settings`에 있어요.
 
