@@ -163,8 +163,8 @@ class LiveEngine:
                         level="critical")
         return {"equity": eq, "peak": peak, "dd": dd, "fraction": base * (2 / 3 if reduced else 1), "halted": halted}
 
-    def _can_open(self, symbol: str, day: int, label: str) -> tuple[float, str]:
-        """(margin, "") or (0, reason)."""
+    def _can_open(self, symbol: str, day: int, label: str, scale: float = 1.0) -> tuple[float, str]:
+        """(margin, "") or (0, reason). `scale` shrinks the normal size (e.g. 0.5 for a weaker signal)."""
         rs = self.risk_state()
         if rs["halted"]:
             return 0.0, f"halted: {rs['halted']}"
@@ -173,7 +173,7 @@ class LiveEngine:
             return 0.0, "already holding this coin"
         if symbol in self._positions(fresh=True):
             return 0.0, "the account already has a position in this coin"
-        margin = rs["equity"] * rs["fraction"]
+        margin = rs["equity"] * rs["fraction"] * scale
         if sum(p.margin for p in active) + margin > self.settings.max_margin_used * rs["equity"] * (1 + 1e-9):
             return 0.0, "margin limit reached"
         return margin, ""
@@ -187,7 +187,8 @@ class LiveEngine:
             if self.store.is_banned(BOOK, c.symbol):
                 notes.append(f"{c.symbol}: skipped, dropped after an earlier stop")
                 continue
-            margin, why = self._can_open(c.symbol, day, "main")
+            scale = 1.0 if (c.ratio or 0) > self.st.full_size_ratio else self.st.reduced_size_share
+            margin, why = self._can_open(c.symbol, day, "main", scale)
             if why:
                 notes.append(f"{c.symbol}: skipped, {why}")
                 self.store.log_skip(day, BOOK, c.symbol, why)

@@ -184,7 +184,7 @@ class FakePublic:
 
 
 def cand():
-    return Candidate(SYM, DAY, 0.25, 150, 0.05, 0.0, ratio=2.0, funding=0.0, funding_interval_h=4, passed=True)
+    return Candidate(SYM, DAY, 0.25, 150, 0.05, 0.0, ratio=2.5, funding=0.0, funding_interval_h=4, passed=True)
 
 
 @pytest.fixture
@@ -680,3 +680,14 @@ def test_no_fallback_entry_when_the_price_is_already_at_the_0900_take_profit(env
     p = _fallback_at(env, 0.85)
     assert p.status == "failed" and ex.pos == 0 and "already at the 09:00 take-profit" in p.note
     assert any("no position" in m for m in msgs)
+
+
+def test_weaker_long_short_ratio_takes_half_size(env):
+    ex, store, eng, msgs = env
+    weak = Candidate("WEAKUSDT", DAY, 0.25, 150, 0.05, 0.0, ratio=1.8, funding=0.0, funding_interval_h=4, passed=True)
+    edge = Candidate("EDGEUSDT", DAY, 0.25, 150, 0.05, 0.0, ratio=2.0, funding=0.0, funding_interval_h=4, passed=True)
+    eng.open_signals([cand(), weak, edge], DAY)
+    by = {p.symbol: p for p in eng.book.all()}
+    assert by[SYM].margin == pytest.approx(1200)                      # ratio 2.5: full 12%
+    assert by["WEAKUSDT"].margin == pytest.approx(600)                # ratio 1.8: 6%
+    assert by["EDGEUSDT"].margin == pytest.approx(600)                # exactly 2.0 is not above the line
