@@ -348,3 +348,11 @@ def test_a_failed_scan_is_retried_until_the_deadline(tmp_path):
     now[0] += 30_000
     r.step()
     assert len(calls) == 2                     # done for the day
+
+
+@pytest.mark.parametrize("ratio, passed", [(1.5, False), (1.51, True), (3.0, True), (3.01, False), (4.2, False)])
+def test_long_short_ratio_window(ratio, passed):
+    c = target(run(universe(), ratio=ratio)[0])
+    assert c.passed is passed
+    if ratio > 3.0:
+        assert "too crowded" in c.reason

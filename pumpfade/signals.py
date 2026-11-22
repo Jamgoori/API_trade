@@ -124,6 +124,8 @@ def scan(day: int, bars: dict[str, dict[int, DayBar]], *, strategy: Strategy,
                 c.reason = "no long/short ratio snapshot"
             elif c.ratio <= st.min_ratio:
                 c.reason = f"long/short ratio {c.ratio:.2f} <= {st.min_ratio}"
+            elif c.ratio > st.max_ratio:
+                c.reason = f"long/short ratio {c.ratio:.2f} > {st.max_ratio} (too crowded)"
             else:
                 f = funding_fn(sym)
                 if f is not None:

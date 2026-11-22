@@ -22,6 +22,7 @@ class Strategy:
     min_rank: int = 100               # only coins ranked below this by trailing 30-day volume
     rank_days: int = 30
     min_ratio: float = 1.5            # global long/short account ratio, last 5-minute snapshot before entry
+    max_ratio: float = 3.0            # above this the longs are so crowded that squeezes win (README 34)
     full_size_ratio: float = 2.0      # main signals with a ratio up to this take a smaller position (README 33)
     reduced_size_share: float = 0.5   # ... of the normal size (12% -> 6%)
     majors: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
