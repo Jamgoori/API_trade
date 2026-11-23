@@ -72,6 +72,8 @@ class Runner:
                                      clock=self.clock)
         else:
             self.engine = PaperEngine(self.client, self.store, settings, notify=self.notifier.send, clock=self.clock)
+        from .paperlong import PaperLongs
+        self.paper_longs = PaperLongs(self.client, self.store, notify=self.notifier.send, clock=self.clock)
         self.commands = None
         if settings.telegram_token and settings.telegram_chat:
             from .tgcmd import TelegramCommands
@@ -88,6 +90,10 @@ class Runner:
         for c in cands:
             self.store.log_signal(day, c.symbol, c.as_row())
         notes = self.engine.open_signals(cands, day)
+        try:
+            notes += self.paper_longs.open(cands, day, majors)
+        except Exception:
+            log.exception("paper longs failed")
         lines = [f"{kst(day)} 09:00 KST scan: majors {majors:+.1%}, {len(cands)} coins up 20%+, "
                  f"{sum(c.passed for c in cands)} passed"]
         for c in cands:
@@ -133,6 +139,10 @@ class Runner:
                 log.exception("listing watcher failed")
                 self.notifier.send(f"listing watcher failed: {exc}", level="warning", key="listings", throttle_s=3600)
         self.engine.tick()
+        try:
+            self.paper_longs.tick()
+        except Exception:
+            log.exception("paper longs failed")
         if self.commands is not None:
             try:
                 self.commands.poll()
@@ -183,7 +193,7 @@ class Runner:
 
     def report(self) -> str:
         if self.live:
-            return self.engine.report()
+            return self.engine.report() + "\n" + self.paper_longs.summary()
         return render(self.store, [b.name for b in self.settings.books], self.settings.start_equity)
 
     def run_forever(self, interval_s: float = 30.0) -> None:

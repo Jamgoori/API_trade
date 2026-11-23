@@ -725,3 +725,54 @@ def test_a_failed_time_exit_keeps_the_stop_in_place(env):
     settle(eng, ex)
     p = eng.book.all()[0]
     assert ex.pos == 0 and p.status == "closed" and p.exit_reason == "time" and open_algos(ex) == []
+
+
+class LongPublic:
+    """Hourly open 1.0 at the entry, then a 1m path given per test."""
+    def __init__(self, path):
+        self.path = path   # list of (minute offset, high, low, close)
+
+    def klines(self, symbol, interval, start_ms=None, end_ms=None, limit=500):
+        if interval == "1h":
+            return [[ENTRY, "1.0", "1.0", "1.0", "1.0", "0", ENTRY + HOUR_MS - 1, "0"]]
+        out = []
+        for k, h, l, c in self.path:
+            t = ENTRY + k * MIN
+            if t >= start_ms and (end_ms is None or t <= end_ms):
+                out.append([t, str(c), str(h), str(l), str(c), "0", t + MIN - 1, "0"])
+        return out[:limit]
+
+
+def _paper(tmp_path, path, now):
+    from pumpfade.paperlong import PaperLongs
+    clock = [now]
+    msgs = []
+    pl = PaperLongs(LongPublic(path), Store(tmp_path / "pl.sqlite"), notify=lambda m, **k: msgs.append(m),
+                    clock=lambda: clock[0])
+    return pl, msgs, clock
+
+
+def test_paper_long_only_on_red_days_and_takes_profit(tmp_path):
+    pl, msgs, clock = _paper(tmp_path, [(0, 1.01, 0.99, 1.0), (30, 1.09, 1.0, 1.08), (60, 1.1, 1.05, 1.06)],
+                             ENTRY + 2 * HOUR_MS)
+    assert pl.open([cand()], DAY, majors=-0.01) == []          # not a red day
+    notes = pl.open([cand()], DAY, majors=-0.05)
+    assert len(notes) == 1 and "paper long" in notes[0]
+    pl.tick()
+    r = pl.db.execute("SELECT status, why, ret FROM paper_longs").fetchone()
+    assert r[0] == "closed" and r[1] == "take-profit" and r[2] == pytest.approx(0.08 - 0.0005 - 0.0002 * 1.08, abs=1e-4)
+    assert any("✅" in m for m in msgs) and "1 closed" in pl.summary()
+
+
+def test_paper_long_stop_wins_a_tie_and_time_exit(tmp_path):
+    pl, msgs, clock = _paper(tmp_path, [(10, 1.2, 0.6, 0.7)], ENTRY + HOUR_MS)
+    pl.open([cand()], DAY, majors=-0.04)
+    pl.tick()
+    assert pl.db.execute("SELECT why FROM paper_longs").fetchone()[0] == "stop"
+    (tmp_path / "b").mkdir()
+    pl2, msgs2, clock2 = _paper(tmp_path / "b", [(k, 1.02, 0.98, 1.01) for k in range(0, 72 * 60, 60)],
+                                ENTRY + 73 * HOUR_MS)
+    pl2.open([cand()], DAY, majors=-0.04)
+    pl2.tick()
+    r = pl2.db.execute("SELECT status, why FROM paper_longs").fetchone()
+    assert tuple(r) == ("closed", "3 days")
