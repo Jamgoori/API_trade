@@ -794,3 +794,51 @@ def test_paper_long_stop_wins_a_tie_and_time_exit(tmp_path):
     pl2.tick()
     r = pl2.db.execute("SELECT status, why FROM paper_longs").fetchone()
     assert tuple(r) == ("closed", "3 days")
+
+
+class ScanPublic:
+    """Daily bars for a /scan preview: PUMPUSDT +25%, NEARUSDT +15%, the majors flat, 120 filler coins."""
+
+    def __init__(self, now):
+        self.now = now
+        self.day = now // DAY_MS
+        self.coins = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "PUMPUSDT", "NEARUSDT"] + [f"F{i}USDT" for i in range(120)]
+
+    def exchange_info(self):
+        return [{"symbol": s, "contractType": "PERPETUAL", "status": "TRADING", "underlyingType": "COIN"}
+                for s in self.coins]
+
+    def klines(self, symbol, interval, start_ms=None, end_ms=None, limit=500):
+        vol = 1.0 if symbol in ("PUMPUSDT", "NEARUSDT") else 1e9
+        last = {"PUMPUSDT": 1.25, "NEARUSDT": 1.15}.get(symbol, 1.0)
+        rows = []
+        for d in range(self.day - 32, self.day + 1):
+            c = last if d == self.day else 1.0
+            rows.append([d * DAY_MS, "1.0", str(c), "1.0", str(c), "0", d * DAY_MS + DAY_MS - 1, str(vol)])
+        return rows
+
+    def funding_intervals(self):
+        return {}
+
+    def long_short_ratio(self, symbol, end_ms):
+        return 2.4, self.now - 60_000
+
+    def funding_history(self, symbol, end_ms=None, limit=5, start_ms=None):
+        return [{"fundingTime": self.now - HOUR_MS, "fundingRate": "0.0001"}]
+
+
+def test_scan_command_previews_the_next_0900_pick(env):
+    from pumpfade.runner import Runner
+
+    ex, store, eng, msgs = env
+    now = (DAY + 1) * DAY_MS + 22 * HOUR_MS          # 07:00 KST
+    pub = ScanPublic(now)
+    r = Runner(eng.settings, client=pub, store=store, notifier=type("N", (), {"send": lambda *a, **k: None})(),
+               clock=lambda: now, trader=ex)
+    text = r.scan_text()
+    assert "✅ PUMPUSDT +25.0%" in text and "롱숏 2.40 → 12%" in text
+    assert "근접: NEARUSDT +15.0%" in text and "메이저 평균 +0.00%" in text
+    r.clock = lambda: (DAY + 2) * DAY_MS - 5 * 60_000  # 08:55 KST: busy with the 09:00 entry
+    assert "09:10" in r.scan_text()
+    from pumpfade.tgcmd import parse
+    assert parse("스캔") == parse("/scan") == "scan"

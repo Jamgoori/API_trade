@@ -184,3 +184,18 @@ def run_scan(client, strategy: Strategy, day: int) -> tuple[list[Candidate], flo
     intervals = client.funding_intervals()
     return scan(day, bars, strategy=strategy, ratio_fn=make_ratio_fn(client, entry_ms),
                 funding_fn=make_funding_fn(client, entry_ms, intervals))
+
+
+def preview_scan(client, strategy: Strategy, now_ms: int, near: float = 0.12) -> tuple[list[Candidate], float, list]:
+    """The scan run on the UTC day still in progress, with the latest long/short ratio, so the owner can see what
+    09:00 KST would pick if the day closed now. Also returns coins up `near`..trigger as (symbol, change) pairs."""
+    day = now_ms // DAY_MS
+    symbols = eligible_symbols(client.exchange_info())
+    bars = load_daily_bars(client, symbols, day, strategy.rank_days)
+    intervals = client.funding_intervals()
+    cands, majors = scan(day, bars, strategy=strategy, ratio_fn=make_ratio_fn(client, now_ms),
+                         funding_fn=make_funding_fn(client, now_ms, intervals))
+    close = sorted(((s, b[day].close / b[day - 1].close - 1) for s, b in bars.items()
+                    if day in b and day - 1 in b and b[day - 1].close > 0
+                    and near <= b[day].close / b[day - 1].close - 1 < strategy.trigger), key=lambda x: -x[1])
+    return cands, majors, close

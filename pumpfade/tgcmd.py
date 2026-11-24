@@ -1,4 +1,4 @@
-"""Read-only Telegram commands: /status and /report, answered only in the configured chat.
+"""Read-only Telegram commands: /status, /report and /scan, answered only in the configured chat.
 
 The bot polls getUpdates (outbound HTTPS only, no open ports). Nothing here can place, change or cancel orders.
 """
@@ -15,11 +15,13 @@ log = logging.getLogger(__name__)
 ALIASES = {
     "/status": "status", "status": "status", "상태": "status", "/상태": "status",
     "/report": "report", "report": "report", "성과": "report", "/성과": "report", "보고": "report",
+    "/scan": "scan", "scan": "scan", "스캔": "scan", "/스캔": "scan", "지금": "scan",
     "/help": "help", "help": "help", "/start": "help", "도움": "help", "/도움": "help",
 }
 HELP = ("조회만 할 수 있어요 (주문은 텔레그램으로 못 해요)\n"
         "/status 또는 상태: 자산과 지금 포지션\n"
-        "/report 또는 성과: 성과 요약")
+        "/report 또는 성과: 성과 요약\n"
+        "/scan 또는 스캔: 지금 마감하면 09:00에 잡힐 코인 (롱숏비율 포함, 1분쯤 걸려요)")
 
 
 def parse(text: str | None) -> str | None:

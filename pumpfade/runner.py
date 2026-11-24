@@ -78,7 +78,8 @@ class Runner:
         if settings.telegram_token and settings.telegram_chat:
             from .tgcmd import TelegramCommands
             self.commands = TelegramCommands(settings.telegram_token, settings.telegram_chat, self.store,
-                                             {"status": self.status_text, "report": self.report})
+                                             {"status": self.status_text, "report": self.report,
+                                              "scan": self.scan_text})
         self.watcher = (ListingWatcher(self.store, self.client, settings, venues=listing_venues,
                                        notify=self.notifier.send, clock=self.clock)
                         if settings.watch_listings else None)
@@ -189,6 +190,31 @@ class Runner:
                 lines.append(f"{lg.book} {lg.symbol} {lg.kind} {lg.status}")
         if not active:
             lines.append("no open positions")
+        return "\n".join(lines)
+
+    def scan_text(self) -> str:
+        """What the 09:00 KST scan would pick if the UTC day closed now, for /scan (read-only)."""
+        from .signals import preview_scan
+        now = self.clock()
+        if now % DAY_MS >= DAY_MS - 10 * 60_000 or now % DAY_MS < 10 * 60_000:
+            return "08:50~09:10에는 09:00 진입 때문에 스캔을 안 해요. 09:10 이후에 다시 보내주세요"
+        cands, majors, close = preview_scan(self.client, self.settings.strategy, now)
+        st = self.settings.strategy
+        lines = [f"지금 기준 {kst(now // DAY_MS)} 09:00 진입 후보 (일봉 마감 전이라 바뀔 수 있어요)",
+                 f"메이저 평균 {majors:+.2%} (허용 {st.majors_min:+.0%}~{st.majors_max:+.0%})"]
+        if not cands:
+            lines.append(f"+{st.trigger:.0%} 이상 코인 없음")
+        for c in cands:
+            ratio = f" 롱숏 {c.ratio:.2f}" if c.ratio is not None else ""
+            size = ""
+            if c.passed:
+                size = " → 12%" if (c.ratio or 0) > st.full_size_ratio else " → 6%"
+            lines.append(f"{'✅' if c.passed else '❌'} {c.symbol} {c.change:+.1%} 순위 {c.rank}{ratio}{size}"
+                         + ("" if c.passed else f" ({c.reason})"))
+        if close:
+            lines.append("근접: " + ", ".join(f"{s} {chg:+.1%}" for s, chg in close[:8]))
+        for row in self.store.listings("scheduled"):
+            lines.append(f"상장빔 예정: {row['perp']} ({row['venue']}) {time.strftime('%m-%d %H:%M', time.gmtime(row['entry_ms'] / 1000 + 9 * 3600))} KST")
         return "\n".join(lines)
 
     def report(self) -> str:
