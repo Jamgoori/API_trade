@@ -2,7 +2,8 @@
 
 Blockmedia posts "업비트, X 원화 마켓 상장" within minutes of the exchange notice. For each listing in
 results/listings.csv, the earliest article in the 3 days before trading opens whose title names the exchange, the
-ticker and a listing is taken as the announcement time. Saves results/krw_announcements.csv.
+ticker and a listing is taken as the announcement time. Since 2026 headlines give only the Korean name, a listing
+headline whose article text names the ticker also counts. Saves results/krw_announcements.csv.
 """
 
 import re
@@ -20,10 +21,11 @@ NAME = {"upbit": "업비트", "bithumb": "빗썸"}
 def articles(query, after, before):
     r = requests.get(API, params={"search": query, "after": after.strftime("%Y-%m-%dT%H:%M:%S"),
                                   "before": before.strftime("%Y-%m-%dT%H:%M:%S"), "per_page": 50,
-                                  "_fields": "date_gmt,title,link"},
+                                  "_fields": "date_gmt,title,link,content"},
                      headers={"User-Agent": "research-script"}, timeout=30)
     r.raise_for_status()
-    return [(pd.Timestamp(a["date_gmt"], tz="UTC"), re.sub("<[^>]+>", "", a["title"]["rendered"]), a["link"]) for a in r.json()]
+    return [(pd.Timestamp(a["date_gmt"], tz="UTC"), re.sub("<[^>]+>", "", a["title"]["rendered"]), a["link"],
+             re.sub("<[^>]+>", " ", a["content"]["rendered"])) for a in r.json()]
 
 
 def main() -> None:
@@ -40,7 +42,10 @@ def main() -> None:
         for q in (f"{ex} {r.base}", f"{ex} 상장"):
             arts = articles(q, a, b)
             time.sleep(1)
-            ok = [x for x in arts if ex in x[1] and "상장" in x[1] and re.search(rf"(?<![A-Z0-9]){r.base}(?![A-Z0-9])", x[1])]
+            tick = re.compile(rf"(?<![A-Za-z0-9]){r.base}(?![A-Za-z0-9])")
+            heads = [x for x in arts if ex in x[1] and "상장" in x[1] and not x[1].startswith("[")]
+            ok = ([x[:3] for x in heads if tick.search(x[1])]
+                  or [x[:3] for x in heads if f"({r.base})" in x[3] or f"({r.base}" in x[3]])
             if ok:
                 hit = min(ok)
                 break
