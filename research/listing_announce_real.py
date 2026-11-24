@@ -26,7 +26,8 @@ def main() -> None:
     epoch = pd.Timestamp(0, tz="UTC")
     a["h0"] = ((a.listed - epoch) // pd.Timedelta(hours=1)).astype(int)
     a["ha"] = ((a.announced - epoch) // pd.Timedelta(hours=1)).astype(int)
-    a = a[a.ha + 1 <= a.h0].reset_index(drop=True)
+    # an article more than 12h before trading is a delayed or misdated listing (one case)
+    a = a[(a.ha + 1 <= a.h0) & (a.listed - a.announced <= pd.Timedelta(hours=12))].reset_index(drop=True)
     lag = (a.listed - a.announced) / pd.Timedelta(hours=1)
     out = ["## KRW listings with real announcement times: short after the announcement vs after trading starts\n",
            f"{len(a)} listings announced 1h+ before trading (hours from announcement to trading: median {lag.median():.1f})\n"]
