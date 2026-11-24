@@ -41,6 +41,7 @@ class Strategy:
     # listing pumps (STRATEGY.md rule 2)
     listing_min_perp_age_days: int = 30
     listing_entry_delay_hours: int = 1   # short this long after the listing's first hour starts
+    reentry_cooldown_hours: int = 72     # no new short on a coin shorted (filled) within this many hours
     listing_max_detect_delay_hours: int = 3  # a listing first seen later than this after it opened is ignored
     usdkrw_range: tuple[float, float] = (1100.0, 1800.0)  # sanity check that a KRW ticker is the same coin
 

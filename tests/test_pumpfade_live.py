@@ -336,6 +336,24 @@ def test_listing_entry_and_positions_the_bot_did_not_open(env):
     assert any("did not open" in m and "OTHERUSDT" in m for m in msgs)
 
 
+def test_a_coin_shorted_in_the_last_three_days_is_not_shorted_again(env):
+    ex, store, eng, msgs = env
+    ex.now = ENTRY + 3 * HOUR_MS
+    eng.open_listing(SYM, "upbit", ex.now)           # first KRW listing
+    ex.set_price(1.2)                                # stopped out within the hour
+    settle(eng, ex)
+    assert eng.book.all()[0].exit_reason == "stop"
+    ex.set_price(1.0)
+    ex.now += 3 * HOUR_MS
+    notes = eng.open_listing(SYM, "bithumb", ex.now)  # the same coin lists on a second exchange
+    assert "last 72h" in notes[0] and len(eng.book.all()) == 1
+    eng.open_signals([cand()], DAY + 1)              # nor the main rule the next morning
+    assert len(eng.book.all()) == 1
+    ex.now += 72 * HOUR_MS
+    eng.open_listing(SYM, "binance_spot", ex.now)    # three days later it may trade again
+    assert len(eng.book.all()) == 2
+
+
 def test_a_single_stale_zero_read_does_not_close_the_trade(env):
     ex, store, eng, msgs = env
     eng.open_signals([cand()], DAY)

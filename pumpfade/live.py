@@ -173,6 +173,9 @@ class LiveEngine:
             return 0.0, "already holding this coin"
         if symbol in self._positions(fresh=True):
             return 0.0, "the account already has a position in this coin"
+        since = self.clock() - self.st.reentry_cooldown_hours * HOUR_MS
+        if any(p.symbol == symbol and p.qty > 0 and (p.entry_ms or p.created_ms) >= since for p in self.book.all()):
+            return 0.0, f"already shorted this coin in the last {self.st.reentry_cooldown_hours}h"
         margin = rs["equity"] * rs["fraction"] * scale
         if self.settings.max_trade_usd > 0:
             margin = min(margin, self.settings.max_trade_usd)
